@@ -525,7 +525,7 @@ const API_URL = document.getElementById('cfg').dataset.apiUrl;
 
 async function load() {{
   try {{
-    const r = await fetch(`${{API_URL}}/invites/${{CODE}}`);
+    const r = await fetch(`${{API_URL}}/v1/invites/${{CODE}}`);
     const d = await r.json();
     if (!r.ok) {{ renderError(d.error || 'Invalid invite'); return; }}
     render(d);
