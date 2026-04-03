@@ -1,0 +1,46 @@
+# ── HTTPS Caddyfile (manual TLS certs) ───────────────────────────────────────
+# Use this when you have your own TLS certificates (e.g. Let's Encrypt).
+#
+# Required in your .env:
+#   CADDYFILE=./caddy/Caddyfile.tls
+#   CERTS_PATH=/etc/letsencrypt/live/yourdomain.com   ← host path to certs
+#   TLS_CERT=/certs/fullchain.pem
+#   TLS_KEY=/certs/privkey.pem
+#
+# Also add this to the caddy volumes in docker-compose.yml:
+#   - ${CERTS_PATH}:/certs:ro
+#
+# Generate self-signed certs for dev:
+#   mkdir -p certs
+#   openssl req -x509 -newkey rsa:4096 -keyout certs/privkey.pem \
+#     -out certs/fullchain.pem -days 365 -nodes -subj "/CN=localhost"
+{
+    admin off
+    auto_https off
+}
+
+# HTTP → HTTPS redirect
+:{$HTTP_PORT:-8081} {
+    redir https://{host}:{$HTTPS_PORT:-8444}{uri} permanent
+}
+
+:{$HTTPS_PORT:-8444} {
+    tls {$TLS_CERT} {$TLS_KEY}
+
+    request_body {
+        max_size 50MB
+    }
+
+    # ── PhaseLink WebSocket ───────────────────────────────────────────────────
+    @ws {
+        path /ws /ws/*
+    }
+    reverse_proxy @ws phaselink:4000
+
+    # ── Everything else → PhaseLink REST API ─────────────────────────────────
+    reverse_proxy phaselink:4000
+
+    log {
+        output stdout
+    }
+}

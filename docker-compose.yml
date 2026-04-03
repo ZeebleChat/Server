@@ -1,0 +1,107 @@
+services:
+  # ── PhaseLink (Zeeble Chat Server) ───────────────────────────────────────────
+  phaselink:
+    build: phaselink/
+    environment:
+      PORT: 4000
+      DB_PATH: /data/zeeble.db
+      AUTH_SERVER_URL: ${AUTH_SERVER_URL:-http://host.docker.internal:3001}
+      OWNER_BEAM_IDENTITY: ${OWNER_BEAM_IDENTITY:-}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8081}
+      LIVEKIT_API_URL: ${LIVEKIT_API_URL:-http://livekit-api:3100}
+      LIVEKIT_SERVER_URL: ${LIVEKIT_SERVER_URL:-http://livekit:7880}
+      RUST_LOG: zeeble_server=info,tower_http=debug
+    volumes:
+      - ./phaselink.yaml:/data/phaselink.yaml
+      - chat-db:/data
+      - ./attachments:/data/attachments
+    restart: unless-stopped
+    networks:
+      - zeeble-net
+
+  # ── Caddy Reverse Proxy ───────────────────────────────────────────────────────
+  # Default: HTTP only  (works out of the box behind Cloudflare Tunnel)
+  # HTTPS:   set CADDYFILE=./caddy/Caddyfile.tls in your .env and provide cert paths
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "${HTTP_PORT:-8081}:8081"
+      - "${HTTPS_PORT:-8444}:8444"
+    volumes:
+      - ${CADDYFILE:-./caddy/Caddyfile.tls}:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      HTTP_PORT: ${HTTP_PORT:-8081}
+      HTTPS_PORT: ${HTTPS_PORT:-8444}
+      TLS_CERT: ${TLS_CERT:-/certs/fullchain.pem}
+      TLS_KEY: ${TLS_KEY:-/certs/privkey.pem}
+    depends_on:
+      - phaselink
+    restart: unless-stopped
+    networks:
+      - zeeble-net
+
+  # ── LiveKit Server ────────────────────────────────────────────────────────────
+  # Runs by default. To disable, add profile: ["livekit"] back and use
+  # docker compose --profile livekit up -d only when needed.
+  livekit:
+    image: livekit/livekit-server:latest
+    command: --bind 0.0.0.0 --config /livekit.yaml
+    ports:
+      - "7880:7880"                        # HTTP / WebSocket
+      - "7881:7881"                        # RTC over TCP
+      - "7882:7882/udp"                    # RTC over UDP
+      - "50100-50120:50100-50120/udp"      # ICE UDP range
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-zeeble-dev-key}: ${LIVEKIT_API_SECRET:-change-me-livekit-secret-min-32-chars}"
+    volumes:
+      - ./livekit.yaml:/livekit.yaml
+    restart: unless-stopped
+    networks:
+      - zeeble-net
+
+  # ── Redis (required by LiveKit) ───────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    command: redis-server --save 60 1 --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - zeeble-net
+
+  # ── LiveKit Management API ────────────────────────────────────────────────────
+  livekit-api:
+    build: livekit
+    ports:
+      - "3100:3100"
+    environment:
+      LIVEKIT_HOST: http://livekit:7880
+      LIVEKIT_PUBLIC_URL: ${LIVEKIT_PUBLIC_URL:-wss://livekit.yourdomain.com}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-change-me-livekit-key}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-change-me-livekit-secret-min-32-chars}
+      BRIDGE_SECRET: ${BRIDGE_SECRET}
+      PORT: 3100
+      RUST_LOG: livekit_server=debug,tower_http=info
+    depends_on:
+      - livekit
+      - redis
+    restart: unless-stopped
+    networks:
+      - zeeble-net
+
+networks:
+  zeeble-net:
+    driver: bridge
+
+volumes:
+  redis-data:
+  chat-db:
+  caddy_data:
+  caddy_config:

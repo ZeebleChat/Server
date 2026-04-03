@@ -1,0 +1,25 @@
+# livekit.yaml — LiveKit server configuration
+# API keys are set via the LIVEKIT_KEYS environment variable in docker-compose.yml.
+# Change LIVEKIT_API_KEY and LIVEKIT_API_SECRET in your .env file.
+
+port: 7880
+rtc:
+  tcp_port: 7881
+  udp_port: 7882
+  port_range_start: 50100
+  port_range_end: 50120
+  use_external_ip: true
+  node_ip: "198.160.26.90"
+
+# Enable TURN server for clients behind strict NAT (production recommended)
+turn:
+  enabled: false
+  domain: livekit.yourdomain.com
+  cert_file: ""
+  key_file: ""
+  tls_port: 5349
+  udp_port: 3478
+
+logging:
+  level: info
+  pion_level: error

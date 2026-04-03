@@ -1,0 +1,15 @@
+port: 4000
+db_path: zeeble.db
+auth_server_url: null
+livekit_api_url: null
+livekit_server_url: null
+server_name: Zeeble Server
+public_url: http://198.160.26.90:8081
+about: null
+max_message_length: 4000
+max_upload_size: 8MB
+invites_anyone_can_create: true
+default_invite_expiry_hours: 0
+default_invite_max_uses: 0
+allow_new_members: true
+logo_attachment_id: 1

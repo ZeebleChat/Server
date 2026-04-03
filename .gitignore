@@ -1,0 +1,25 @@
+# IDE files
+.idea/
+.vscode/
+
+# Build artifacts
+phaselink/target/
+livekit/target/
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# Environment overrides (copy .env.example → .env and fill in your values)
+.env
+
+# TLS certificates & private keys — NEVER commit these
+*.pem
+*.key
+*.crt
+*.cert
+*.p12
+*.pfx
+certs/
+nginx/certs/
