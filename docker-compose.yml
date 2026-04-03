@@ -9,6 +9,7 @@ services:
       OWNER_BEAM_IDENTITY: ${OWNER_BEAM_IDENTITY:-}
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8081}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      BRIDGE_SECRET: ${BRIDGE_SECRET}
       LIVEKIT_API_URL: ${LIVEKIT_API_URL:-http://livekit-api:3100}
       LIVEKIT_SERVER_URL: ${LIVEKIT_SERVER_URL:-http://livekit:7880}
       RUST_LOG: zeeble_server=info,tower_http=debug
@@ -89,6 +90,7 @@ services:
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-change-me-livekit-secret-min-32-chars}
       BRIDGE_SECRET: ${BRIDGE_SECRET}
       PORT: 3100
+      BIND_ADDRESS: "0.0.0.0"
       RUST_LOG: livekit_server=debug,tower_http=info
     depends_on:
       - livekit

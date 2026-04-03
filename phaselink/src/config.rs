@@ -79,6 +79,8 @@ pub struct Config {
     /// Internal URL of the LiveKit server (unused; clients connect directly via
     /// `livekit_url` from the token response). Kept for backwards compatibility.
     pub livekit_server_url: String,
+    /// Shared secret sent as `X-Bridge-Secret` to the livekit-api bridge.
+    pub livekit_bridge_secret: String,
     /// LiveKit API secret (startup-only, used for validation warning at boot).
     pub livekit_api_secret: String,
     /// Path to the config file that was loaded (or None if not found).
@@ -324,6 +326,10 @@ impl Config {
             .or_else(|| file.livekit_api_secret.clone())
             .unwrap_or_default();
 
+        let livekit_bridge_secret = std::env::var("BRIDGE_SECRET")
+            .ok()
+            .unwrap_or_default();
+
         let trusted_proxies = std::env::var("TRUSTED_PROXIES")
             .ok()
             .map(|s| parse_list(&s))
@@ -353,6 +359,7 @@ impl Config {
                 auth_server_url,
                 livekit_api_url,
                 livekit_server_url,
+                livekit_bridge_secret,
                 livekit_api_secret,
                 config_path,
                 trusted_proxies,

@@ -54,7 +54,7 @@ pub async fn get_voice_token(
         "ttl": 3600,
     });
 
-    forward_livekit_with_url(&url, &body).await
+    forward_livekit_with_url(&url, &body, &state.livekit_bridge_secret).await
 }
 
 // ── GET /voice/rooms ──────────────────────────────────────────────────────────
@@ -71,7 +71,7 @@ pub async fn get_voice_rooms(
     let url = format!("{}/rooms", state.livekit_api_url);
     let client = reqwest::Client::new();
 
-    match client.get(&url).send().await {
+    match client.get(&url).header("X-Bridge-Secret", &state.livekit_bridge_secret).send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
             Ok(data) => Json(data).into_response(),
             Err(e) => (
@@ -101,9 +101,9 @@ pub async fn get_voice_rooms(
 /// POST `url` with `body` and return the response unchanged.
 /// The LiveKit API response includes the `livekit_url` field which clients
 /// will connect to directly (no reverse proxy involvement).
-async fn forward_livekit_with_url(url: &str, body: &Value) -> axum::response::Response {
+async fn forward_livekit_with_url(url: &str, body: &Value, bridge_secret: &str) -> axum::response::Response {
     let client = reqwest::Client::new();
-    match client.post(url).json(body).send().await {
+    match client.post(url).header("X-Bridge-Secret", bridge_secret).json(body).send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
             Ok(data) => {
                 Json(data).into_response()

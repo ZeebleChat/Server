@@ -287,6 +287,8 @@ pub struct AppState {
     pub server_bus: broadcast::Sender<String>,
     /// LiveKit API management service URL.
     pub livekit_api_url: String,
+    /// Shared secret sent as `X-Bridge-Secret` to the livekit-api bridge.
+    pub livekit_bridge_secret: String,
     /// Internal LiveKit server URL (unused; clients connect directly via
     /// `livekit_url` from token response). Kept for backwards compatibility.
     pub livekit_server_url: String,
@@ -1010,6 +1012,7 @@ fn main() {
         settings: Arc::clone(&settings),
         server_bus,
         livekit_api_url: config.livekit_api_url.clone(),
+        livekit_bridge_secret: config.livekit_bridge_secret.clone(),
         livekit_server_url: config.livekit_server_url.clone(),
         locked: Arc::new(AtomicBool::new(!start_unlocked)),
         unlock_attempts: Mutex::new(HashMap::new()),

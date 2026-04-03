@@ -37,6 +37,12 @@
     }
     reverse_proxy @ws phaselink:4000
 
+    # ── LiveKit WebSocket (voice/video) ───────────────────────────────────────
+    @livekit {
+        path /rtc /rtc/*
+    }
+    reverse_proxy @livekit livekit:7880
+
     # ── Everything else → PhaseLink REST API ─────────────────────────────────
     reverse_proxy phaselink:4000
 

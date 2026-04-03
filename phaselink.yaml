@@ -3,6 +3,8 @@ db_path: zeeble.db
 auth_server_url: null
 livekit_api_url: null
 livekit_server_url: null
+livekit_api_key: null
+livekit_api_secret: null
 server_name: Zeeble Server
 public_url: http://198.160.26.90:8081
 about: null
