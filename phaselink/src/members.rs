@@ -1,5 +1,5 @@
 use super::*;
-use axum::extract::Extension;
+use axum::extract::{Extension, Path};
 use axum::Json;
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
@@ -44,7 +44,12 @@ pub async fn get_members(
         };
         let mut stmt = match db.prepare(
             "SELECT src.beam_identity, COUNT(m.id) as message_count, COALESCE(MAX(u.status), 'offline') as status, MAX(u.avatar_attachment_id) as avatar_id, MAX(u.role) as role
-             FROM (SELECT beam_identity FROM users UNION SELECT beam_identity FROM messages) src
+             FROM (
+               SELECT beam_identity FROM users WHERE is_deleted = 0
+               UNION
+               SELECT DISTINCT beam_identity FROM messages
+               WHERE beam_identity NOT IN (SELECT beam_identity FROM users WHERE is_deleted = 1)
+             ) src
              LEFT JOIN users u ON u.beam_identity = src.beam_identity
              LEFT JOIN messages m ON m.beam_identity = src.beam_identity
              GROUP BY src.beam_identity
@@ -111,6 +116,46 @@ pub async fn get_members(
     }
 
     Json(categories).into_response()
+}
+
+/// DELETE /v1/members/:identity — leave the server (soft-delete the user record)
+pub async fn delete_member(
+    Path(identity): Path<String>,
+    headers: HeaderMap,
+    Extension(state): Extension<Arc<AppState>>,
+) -> impl IntoResponse {
+    let requester = match require_auth(&state, &headers).await {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+
+    if requester != identity {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "Cannot remove another member" }))).into_response();
+    }
+
+    let owner = state.settings.read().await.owner_beam_identity.clone();
+    if identity == owner {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "Owner cannot leave; delete the server instead" }))).into_response();
+    }
+
+    let db = match state.db.lock() {
+        Ok(db) => db,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
+    };
+
+    match db.execute(
+        "UPDATE users SET is_deleted = 1, status = 'offline' WHERE beam_identity = ?1",
+        rusqlite::params![identity],
+    ) {
+        Ok(_) => {
+            info!("{identity} left the server");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => {
+            error!("delete_member: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB error" }))).into_response()
+        }
+    }
 }
 
 pub async fn update_status(

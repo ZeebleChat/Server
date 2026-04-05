@@ -715,25 +715,42 @@ pub async fn join_redeem(
             .into_response();
     }
 
-    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let rows_affected = db.execute(
-        "UPDATE invites SET use_count = use_count + 1 \
-         WHERE code = ?1 AND (expires_at IS NULL OR expires_at > ?2) \
-         AND (max_uses IS NULL OR use_count < max_uses)",
-        rusqlite::params![code, now],
-    );
+    // Confine the MutexGuard to this block so it is dropped before any `.await`.
+    // MutexGuard<Connection> is !Send; keeping it across an await makes the future
+    // non-Send and breaks the axum Handler<_, _> trait bound.
+    let rows_affected = {
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db.execute(
+            "UPDATE invites SET use_count = use_count + 1 \
+             WHERE code = ?1 AND (expires_at IS NULL OR expires_at > ?2) \
+             AND (max_uses IS NULL OR use_count < max_uses)",
+            rusqlite::params![code, now],
+        )
+    }; // MutexGuard dropped here — no await has occurred yet
 
     match rows_affected {
         Ok(1) => {
             info!("{identity} redeemed invite {code} via web join page");
+            // Register new member in users table so they appear immediately in the member list.
+            // Second lock is in its own block, also dropped before the await below.
+            {
+                let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = db.execute(
+                    "INSERT OR IGNORE INTO users (beam_identity, status) VALUES (?1, 'offline')",
+                    rusqlite::params![identity],
+                );
+            }
+            state.broadcast_member_update().await;
             Json(json!({ "ok": true, "identity": identity })).into_response()
         }
         Ok(0) => {
+            // Acquire a fresh lock for diagnostic queries — no await in this arm.
+            let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
             let exists: bool = db
                 .query_row(
                     "SELECT 1 FROM invites WHERE code = ?1",

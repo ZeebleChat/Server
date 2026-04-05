@@ -104,6 +104,7 @@ fn create_router(state: Arc<AppState>) -> Router<()> {
         .route("/v1/categories/:id/permissions", get(permissions::list_category_perms))
         .route("/v1/categories/:id/permissions/:role", put(permissions::set_category_perm).delete(permissions::delete_category_perm))
         .route("/v1/members", get(members::get_members))
+        .route("/v1/members/:identity", delete(members::delete_member))
         .route("/v1/account/status", patch(members::update_status))
         .route("/v1/categories", get(categories::list_categories).post(categories::create_category))
         .route(
@@ -126,6 +127,7 @@ fn create_router(state: Arc<AppState>) -> Router<()> {
         .route("/v1/ws", get(ws::ws_handler))
         .route("/v1/voice/token", get(voice::get_voice_token))
         .route("/v1/voice/rooms", get(voice::get_voice_rooms))
+        .route("/v1/voice/participants/:channel_id", get(voice::get_voice_participants))
         .route("/v1/server/info", get(server_info))
         .route("/v1/server/settings", get(server_settings::get_settings).patch(server_settings::patch_settings))
         // Bot management (owner only)

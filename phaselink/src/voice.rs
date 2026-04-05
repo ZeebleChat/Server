@@ -4,7 +4,7 @@
 
 use axum::{
     Json,
-    extract::{Extension, Query},
+    extract::{Extension, Path, Query},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -80,6 +80,57 @@ pub async fn get_voice_rooms(
             )
                 .into_response(),
         },
+        Ok(resp) => {
+            let status = resp.status();
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("LiveKit API returned {status}") })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("Could not reach LiveKit API: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+// ── GET /voice/participants/:channel_id ───────────────────────────────────────
+
+/// List participants in a LiveKit room (channel).
+pub async fn get_voice_participants(
+    Extension(state): Extension<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers).await {
+        return e.into_response();
+    }
+
+    if channel_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "channel_id is required" })),
+        )
+            .into_response();
+    }
+
+    let url = format!("{}/rooms/{}/participants", state.livekit_api_url, channel_id);
+    let client = reqwest::Client::new();
+
+    match client.get(&url).header("X-Bridge-Secret", &state.livekit_bridge_secret).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(data) => Json(data).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to parse LiveKit response: {e}") })),
+            )
+                .into_response(),
+        },
+        Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
+            Json(json!({ "participants": [] })).into_response()
+        }
         Ok(resp) => {
             let status = resp.status();
             (
