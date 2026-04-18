@@ -8,6 +8,10 @@ pub struct ChatMessage {
     pub channel_id: String,
     pub beam_identity: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<i64>,
     pub created_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edited_at: Option<i64>,
@@ -30,6 +34,10 @@ pub struct WsBroadcast {
     pub id: i64,
     pub beam_identity: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<i64>,
     pub created_at: i64,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub attachments: Vec<Attachment>,
@@ -61,12 +69,13 @@ pub struct EditMessageBody {
     pub content: String,
 }
 
-/// Phase 4.1: Helper to build ChatMessage from query row data
 fn build_message_from_row(
     msg_id: i64,
     channel_id: String,
     beam_identity: String,
     content: String,
+    title: Option<String>,
+    reply_to: Option<i64>,
     created_at: i64,
     edited_at: Option<i64>,
 ) -> ChatMessage {
@@ -75,6 +84,8 @@ fn build_message_from_row(
         channel_id,
         beam_identity,
         content,
+        title,
+        reply_to,
         created_at,
         edited_at,
         attachments: Vec::new(),
@@ -90,13 +101,13 @@ fn fetch_messages_with_attachments(
     limit: i64,
 ) -> rusqlite::Result<Vec<ChatMessage>> {
     let sql = if before_id.is_some() {
-        "SELECT m.id, m.channel_id, m.beam_identity, m.content, m.created_at, m.edited_at, a.id, a.filename, a.mime_type, a.file_size
+        "SELECT m.id, m.channel_id, m.beam_identity, m.content, m.title, m.reply_to, m.created_at, m.edited_at, a.id, a.filename, a.mime_type, a.file_size
          FROM messages m
          LEFT JOIN attachments a ON m.id = a.message_id
          WHERE m.channel_id = ?1 AND m.id < ?2
          ORDER BY m.created_at DESC, m.id DESC LIMIT ?3"
     } else {
-        "SELECT m.id, m.channel_id, m.beam_identity, m.content, m.created_at, m.edited_at, a.id, a.filename, a.mime_type, a.file_size
+        "SELECT m.id, m.channel_id, m.beam_identity, m.content, m.title, m.reply_to, m.created_at, m.edited_at, a.id, a.filename, a.mime_type, a.file_size
          FROM messages m
          LEFT JOIN attachments a ON m.id = a.message_id
          WHERE m.channel_id = ?1
@@ -121,27 +132,21 @@ fn fetch_messages_with_attachments(
         let row_channel_id: String = row.get(1)?;
         let beam_identity: String = row.get(2)?;
         let content: String = row.get(3)?;
-        let created_at: i64 = row.get(4)?;
-        let edited_at: Option<i64> = row.get(5)?;
-        let att_id: Option<i64> = row.get(6)?;
-        let att_filename: Option<String> = row.get(7)?;
-        let att_mime_type: Option<String> = row.get(8)?;
-        let att_file_size: Option<i64> = row.get(9)?;
+        let title: Option<String> = row.get(4)?;
+        let reply_to: Option<i64> = row.get(5)?;
+        let created_at: i64 = row.get(6)?;
+        let edited_at: Option<i64> = row.get(7)?;
+        let att_id: Option<i64> = row.get(8)?;
+        let att_filename: Option<String> = row.get(9)?;
+        let att_mime_type: Option<String> = row.get(10)?;
+        let att_file_size: Option<i64> = row.get(11)?;
 
         // Check if we've moved to a new message
         if let Some(prev_id) = current_message_id {
             if prev_id != msg_id {
                 // Push the previous message with its attachments
                 if let Some(msg) = current_message.take() {
-                    rows.push(ChatMessage {
-                        id: msg.id,
-                        channel_id: msg.channel_id,
-                        beam_identity: msg.beam_identity,
-                        content: msg.content,
-                        created_at: msg.created_at,
-                        edited_at: msg.edited_at,
-                        attachments: current_attachments.clone(),
-                    });
+                    rows.push(ChatMessage { attachments: current_attachments.clone(), ..msg });
                 }
                 current_attachments.clear();
             }
@@ -154,6 +159,8 @@ fn fetch_messages_with_attachments(
             row_channel_id,
             beam_identity,
             content,
+            title,
+            reply_to,
             created_at,
             edited_at,
         ));
@@ -173,15 +180,7 @@ fn fetch_messages_with_attachments(
 
     // Don't forget the last message
     if let Some(msg) = current_message.take() {
-        rows.push(ChatMessage {
-            id: msg.id,
-            channel_id: msg.channel_id,
-            beam_identity: msg.beam_identity,
-            content: msg.content,
-            created_at: msg.created_at,
-            edited_at: msg.edited_at,
-            attachments: current_attachments.clone(),
-        });
+        rows.push(ChatMessage { attachments: current_attachments.clone(), ..msg });
     }
 
     Ok(rows)
@@ -425,6 +424,152 @@ pub async fn edit_message(
             .into_response()
         }
     }
+}
+
+pub async fn get_board_posts(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(channel_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let identity = match require_auth(&state, &headers).await {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let perms = crate::permissions::resolve_channel_access(&state, &identity, &channel_id).await;
+    if !perms.get("view_channel").copied().unwrap_or(false) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "No permission" }))).into_response();
+    }
+    let db = match state.db.lock() {
+        Ok(db) => db,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
+    };
+    let rows: Vec<ChatMessage> = {
+        let mut stmt = match db.prepare(
+            "SELECT m.id, m.channel_id, m.beam_identity, m.content, m.title, m.reply_to, m.created_at, m.edited_at, a.id, a.filename, a.mime_type, a.file_size
+             FROM messages m
+             LEFT JOIN attachments a ON m.id = a.message_id
+             WHERE m.channel_id = ?1 AND m.reply_to IS NULL
+             ORDER BY m.created_at DESC, m.id DESC LIMIT 200"
+        ) {
+            Ok(s) => s,
+            Err(e) => { error!("get_board_posts prepare: {e}"); return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB error" }))).into_response(); }
+        };
+        let mut current_message_id: Option<i64> = None;
+        let mut current_attachments: Vec<Attachment> = Vec::new();
+        let mut current_message: Option<ChatMessage> = None;
+        let mut results: Vec<ChatMessage> = Vec::new();
+        let mut rows_iter = match stmt.query(rusqlite::params![channel_id]) {
+            Ok(r) => r,
+            Err(e) => { error!("get_board_posts query: {e}"); return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB error" }))).into_response(); }
+        };
+        while let Ok(Some(row)) = rows_iter.next() {
+            let msg_id: i64 = row.get(0).unwrap_or_default();
+            let row_channel_id: String = row.get(1).unwrap_or_default();
+            let beam_identity: String = row.get(2).unwrap_or_default();
+            let content: String = row.get(3).unwrap_or_default();
+            let title: Option<String> = row.get(4).unwrap_or(None);
+            let reply_to: Option<i64> = row.get(5).unwrap_or(None);
+            let created_at: i64 = row.get(6).unwrap_or_default();
+            let edited_at: Option<i64> = row.get(7).unwrap_or(None);
+            let att_id: Option<i64> = row.get(8).unwrap_or(None);
+            let att_filename: Option<String> = row.get(9).unwrap_or(None);
+            let att_mime_type: Option<String> = row.get(10).unwrap_or(None);
+            let att_file_size: Option<i64> = row.get(11).unwrap_or(None);
+            if let Some(prev_id) = current_message_id {
+                if prev_id != msg_id {
+                    if let Some(msg) = current_message.take() {
+                        results.push(ChatMessage { attachments: current_attachments.clone(), ..msg });
+                    }
+                    current_attachments.clear();
+                }
+            }
+            current_message_id = Some(msg_id);
+            current_message = Some(build_message_from_row(msg_id, row_channel_id, beam_identity, content, title, reply_to, created_at, edited_at));
+            if let (Some(id), Some(filename), Some(mime_type), Some(file_size)) = (att_id, att_filename, att_mime_type, att_file_size) {
+                current_attachments.push(Attachment { id, filename, mime_type, file_size });
+            }
+        }
+        if let Some(msg) = current_message.take() {
+            results.push(ChatMessage { attachments: current_attachments, ..msg });
+        }
+        results
+    };
+    Json(rows).into_response()
+}
+
+pub async fn get_post_replies(
+    Extension(state): Extension<Arc<AppState>>,
+    Path((channel_id, post_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let identity = match require_auth(&state, &headers).await {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let perms = crate::permissions::resolve_channel_access(&state, &identity, &channel_id).await;
+    if !perms.get("view_channel").copied().unwrap_or(false) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "No permission" }))).into_response();
+    }
+    let post_id_int: i64 = match post_id.parse() {
+        Ok(v) => v,
+        Err(_) => return Json(Vec::<ChatMessage>::new()).into_response(),
+    };
+    let db = match state.db.lock() {
+        Ok(db) => db,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
+    };
+    let rows: Vec<ChatMessage> = {
+        let mut stmt = match db.prepare(
+            "SELECT m.id, m.channel_id, m.beam_identity, m.content, m.title, m.reply_to, m.created_at, m.edited_at, a.id, a.filename, a.mime_type, a.file_size
+             FROM messages m
+             LEFT JOIN attachments a ON m.id = a.message_id
+             WHERE m.channel_id = ?1 AND m.reply_to = ?2
+             ORDER BY m.created_at ASC, m.id ASC LIMIT 500"
+        ) {
+            Ok(s) => s,
+            Err(e) => { error!("get_post_replies prepare: {e}"); return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB error" }))).into_response(); }
+        };
+        let mut current_message_id: Option<i64> = None;
+        let mut current_attachments: Vec<Attachment> = Vec::new();
+        let mut current_message: Option<ChatMessage> = None;
+        let mut results: Vec<ChatMessage> = Vec::new();
+        let mut rows_iter = match stmt.query(rusqlite::params![channel_id, post_id_int]) {
+            Ok(r) => r,
+            Err(e) => { error!("get_post_replies query: {e}"); return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB error" }))).into_response(); }
+        };
+        while let Ok(Some(row)) = rows_iter.next() {
+            let msg_id: i64 = row.get(0).unwrap_or_default();
+            let row_channel_id: String = row.get(1).unwrap_or_default();
+            let beam_identity: String = row.get(2).unwrap_or_default();
+            let content: String = row.get(3).unwrap_or_default();
+            let title: Option<String> = row.get(4).unwrap_or(None);
+            let reply_to: Option<i64> = row.get(5).unwrap_or(None);
+            let created_at: i64 = row.get(6).unwrap_or_default();
+            let edited_at: Option<i64> = row.get(7).unwrap_or(None);
+            let att_id: Option<i64> = row.get(8).unwrap_or(None);
+            let att_filename: Option<String> = row.get(9).unwrap_or(None);
+            let att_mime_type: Option<String> = row.get(10).unwrap_or(None);
+            let att_file_size: Option<i64> = row.get(11).unwrap_or(None);
+            if let Some(prev_id) = current_message_id {
+                if prev_id != msg_id {
+                    if let Some(msg) = current_message.take() {
+                        results.push(ChatMessage { attachments: current_attachments.clone(), ..msg });
+                    }
+                    current_attachments.clear();
+                }
+            }
+            current_message_id = Some(msg_id);
+            current_message = Some(build_message_from_row(msg_id, row_channel_id, beam_identity, content, title, reply_to, created_at, edited_at));
+            if let (Some(id), Some(filename), Some(mime_type), Some(file_size)) = (att_id, att_filename, att_mime_type, att_file_size) {
+                current_attachments.push(Attachment { id, filename, mime_type, file_size });
+            }
+        }
+        if let Some(msg) = current_message.take() {
+            results.push(ChatMessage { attachments: current_attachments, ..msg });
+        }
+        results
+    };
+    Json(rows).into_response()
 }
 
 pub async fn delete_message(

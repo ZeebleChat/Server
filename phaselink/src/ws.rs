@@ -25,6 +25,10 @@ pub enum WsIncoming {
         content: String,
         #[serde(default)]
         attachment_ids: Vec<i64>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        reply_to: Option<String>,
     },
     Leave {
         channel_id: String,
@@ -150,7 +154,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         }
                     }
 
-                    WsIncoming::Message { token, channel_id, content, attachment_ids } => {
+                    WsIncoming::Message { token, channel_id, content, attachment_ids, title, reply_to } => {
                         let id = match resolve_identity(&token, &state).await {
                             Some(id) => id,
                             None => { send_err(&mut socket, "Token expired").await; break; }
@@ -165,6 +169,9 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             continue;
                         }
 
+                        // Parse reply_to as integer (ignore optimistic opt-xxx IDs)
+                        let reply_to_int: Option<i64> = reply_to.as_deref().and_then(|s| s.parse().ok());
+
                         let created_at = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -177,8 +184,8 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
                             // Insert the message
                             tx.execute(
-                                "INSERT INTO messages (channel_id, beam_identity, content, created_at) VALUES (?1, ?2, ?3, ?4)",
-                                rusqlite::params![channel_id, &id, content, created_at],
+                                "INSERT INTO messages (channel_id, beam_identity, content, title, reply_to, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                rusqlite::params![channel_id, &id, content, title, reply_to_int, created_at],
                             ).expect("Failed to insert message");
 
                             let msg_id = tx.last_insert_rowid();
@@ -238,6 +245,8 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             channel_id: channel_id.clone(),
                             beam_identity: id.clone(),
                             content: content.clone(),
+                            title: title.clone(),
+                            reply_to: reply_to_int,
                             created_at,
                             attachments,
                         }).unwrap();

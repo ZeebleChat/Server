@@ -6,9 +6,9 @@ port: 7880
 rtc:
   tcp_port: 7881
   udp_port: 7882
-  port_range_start: 50100
-  port_range_end: 50120
-  use_external_ip: true
+  port_range_start: 50200
+  port_range_end: 50220
+  use_external_ip: false
   node_ip: "198.160.26.90"
 
 # Enable TURN server for clients behind strict NAT (production recommended)

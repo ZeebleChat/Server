@@ -86,6 +86,14 @@ fn create_router(state: Arc<AppState>) -> Router<()> {
             get(messages::get_messages).post(messages::create_message),
         )
         .route(
+            "/v1/channels/:channel_id/posts",
+            get(messages::get_board_posts),
+        )
+        .route(
+            "/v1/channels/:channel_id/posts/:post_id/replies",
+            get(messages::get_post_replies),
+        )
+        .route(
             "/v1/messages/:message_id",
             patch(messages::edit_message).delete(messages::delete_message),
         )
@@ -615,6 +623,8 @@ CREATE TABLE IF NOT EXISTS users (
     run_migration(conn, "channels", "category_id",       "ALTER TABLE channels ADD COLUMN category_id INTEGER");
     run_migration(conn, "channels", "position",          "ALTER TABLE channels ADD COLUMN position INTEGER DEFAULT 0");
     run_migration(conn, "messages",     "bot_id",      "ALTER TABLE messages ADD COLUMN bot_id TEXT REFERENCES bots(id)");
+    run_migration(conn, "messages",     "title",       "ALTER TABLE messages ADD COLUMN title TEXT");
+    run_migration(conn, "messages",     "reply_to",    "ALTER TABLE messages ADD COLUMN reply_to INTEGER REFERENCES messages(id) ON DELETE SET NULL");
     run_migration(conn, "custom_roles", "hoist",       "ALTER TABLE custom_roles ADD COLUMN hoist INTEGER NOT NULL DEFAULT 0");
     run_migration(conn, "custom_roles", "permissions", "ALTER TABLE custom_roles ADD COLUMN permissions TEXT NOT NULL DEFAULT '{}'");
     run_migration(conn, "channel_permissions",  "allow", "ALTER TABLE channel_permissions ADD COLUMN allow TEXT NOT NULL DEFAULT '{}'");

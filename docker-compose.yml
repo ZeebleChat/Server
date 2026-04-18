@@ -9,7 +9,7 @@ services:
       OWNER_BEAM_IDENTITY: ${OWNER_BEAM_IDENTITY:-}
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8081}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
-      BRIDGE_SECRET: ${BRIDGE_SECRET}
+      BRIDGE_SECRET: ${BRIDGE_SECRET:-}
       LIVEKIT_API_URL: ${LIVEKIT_API_URL:-http://livekit-api:3100}
       LIVEKIT_SERVER_URL: ${LIVEKIT_SERVER_URL:-http://livekit:7880}
       RUST_LOG: zeeble_server=info,tower_http=debug
@@ -51,10 +51,10 @@ services:
     image: livekit/livekit-server:latest
     command: --bind 0.0.0.0 --config /livekit.yaml
     ports:
-      - "7880:7880"                        # HTTP / WebSocket
-      - "7881:7881"                        # RTC over TCP
-      - "7882:7882/udp"                    # RTC over UDP
-      - "50100-50120:50100-50120/udp"      # ICE UDP range
+      - "7970:7880"                        # HTTP / WebSocket
+      - "7971:7881"                        # RTC over TCP
+      - "7972:7882/udp"                    # RTC over UDP
+      - "50200-50220:50200-50220/udp"      # ICE UDP range
     environment:
       LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-zeeble-dev-key}: ${LIVEKIT_API_SECRET:-change-me-livekit-secret-min-32-chars}"
     volumes:
@@ -88,7 +88,7 @@ services:
       LIVEKIT_PUBLIC_URL: ${LIVEKIT_PUBLIC_URL:-wss://livekit.yourdomain.com}
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-change-me-livekit-key}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-change-me-livekit-secret-min-32-chars}
-      BRIDGE_SECRET: ${BRIDGE_SECRET}
+      BRIDGE_SECRET: ${BRIDGE_SECRET:-}
       PORT: 3100
       BIND_ADDRESS: "0.0.0.0"
       RUST_LOG: livekit_server=debug,tower_http=info

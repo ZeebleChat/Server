@@ -21,6 +21,11 @@ pub async fn bridge_secret_middleware(
         return Ok(next.run(request).await);
     }
 
+    // If no secret is configured, skip auth entirely
+    if state.config.bridge_secret.is_empty() {
+        return Ok(next.run(request).await);
+    }
+
     let headers = request.headers();
     let secret = headers
         .get("X-Bridge-Secret")

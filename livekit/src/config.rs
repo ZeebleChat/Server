@@ -43,7 +43,7 @@ impl Config {
 
         Ok(Config {
             bind_address: std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "127.0.0.1".into()),
-            bridge_secret: std::env::var("BRIDGE_SECRET").context("BRIDGE_SECRET must be set")?,
+            bridge_secret: std::env::var("BRIDGE_SECRET").unwrap_or_default(),
             allowed_origins,
             livekit_host,
             livekit_public_url,
