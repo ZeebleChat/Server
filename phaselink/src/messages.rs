@@ -381,13 +381,13 @@ pub async fn edit_message(
         }
     };
 
-    // Fetch channel_id so we can broadcast the edit
-    let channel_id: String = match db.query_row(
-        "SELECT channel_id FROM messages WHERE id = ?1 AND beam_identity = ?2",
+    // Fetch channel_id and current content so we can save history and broadcast
+    let (channel_id, old_content): (String, String) = match db.query_row(
+        "SELECT channel_id, content FROM messages WHERE id = ?1 AND beam_identity = ?2",
         rusqlite::params![message_id, identity],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     ) {
-        Ok(ch) => ch,
+        Ok(data) => data,
         Err(_) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -396,6 +396,12 @@ pub async fn edit_message(
             .into_response();
         }
     };
+
+    // Save previous content to edit history before overwriting
+    let _ = db.execute(
+        "INSERT INTO message_edit_history (message_id, content, edited_by, edited_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![message_id, old_content, identity, edited_at],
+    );
 
     match db.execute(
         "UPDATE messages SET content = ?1, edited_at = ?2 WHERE id = ?3 AND beam_identity = ?4",
@@ -424,6 +430,72 @@ pub async fn edit_message(
             .into_response()
         }
     }
+}
+
+pub async fn get_message_history(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(message_id): Path<i64>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let identity = match require_auth(&state, &headers).await {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+
+    // Get channel_id first (drop lock before async perm check)
+    let channel_id: String = {
+        let db = match state.db.lock() {
+            Ok(db) => db,
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
+        };
+        match db.query_row(
+            "SELECT channel_id FROM messages WHERE id = ?1",
+            rusqlite::params![message_id],
+            |row| row.get(0),
+        ) {
+            Ok(ch) => ch,
+            Err(_) => return (StatusCode::NOT_FOUND, Json(json!({ "error": "Message not found" }))).into_response(),
+        }
+    };
+
+    let perms = crate::permissions::resolve_channel_access(&state, &identity, &channel_id).await;
+    if !perms.get("view_channel").copied().unwrap_or(false) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "No permission" }))).into_response();
+    }
+
+    let db = match state.db.lock() {
+        Ok(db) => db,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
+    };
+
+    #[derive(Serialize)]
+    struct HistoryEntry {
+        content: String,
+        edited_by: String,
+        edited_at: i64,
+    }
+
+    let mut stmt = match db.prepare(
+        "SELECT content, edited_by, edited_at FROM message_edit_history WHERE message_id = ?1 ORDER BY edited_at ASC"
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("get_message_history prepare: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB error" }))).into_response();
+        }
+    };
+
+    let entries: Vec<HistoryEntry> = match stmt.query_map(rusqlite::params![message_id], |row| {
+        Ok(HistoryEntry { content: row.get(0)?, edited_by: row.get(1)?, edited_at: row.get(2)? })
+    }) {
+        Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            error!("get_message_history query: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB error" }))).into_response();
+        }
+    };
+
+    Json(json!({ "history": entries })).into_response()
 }
 
 pub async fn get_board_posts(

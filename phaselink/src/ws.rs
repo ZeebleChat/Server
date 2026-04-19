@@ -286,13 +286,17 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
                         let (updated, channel_id) = {
                             let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
-                            // Fetch the channel_id so we can broadcast the edit
-                            let ch: Option<String> = db.query_row(
-                                "SELECT channel_id FROM messages WHERE id = ?1 AND beam_identity = ?2",
+                            // Fetch channel_id and old content to save history
+                            let row: Option<(String, String)> = db.query_row(
+                                "SELECT channel_id, content FROM messages WHERE id = ?1 AND beam_identity = ?2",
                                 rusqlite::params![message_id, id],
-                                |row| row.get(0),
+                                |row| Ok((row.get(0)?, row.get(1)?)),
                             ).ok();
-                            if let Some(ref ch) = ch {
+                            if let Some((ref ch, ref old_content)) = row {
+                                let _ = db.execute(
+                                    "INSERT INTO message_edit_history (message_id, content, edited_by, edited_at) VALUES (?1, ?2, ?3, ?4)",
+                                    rusqlite::params![message_id, old_content, id, edited_at],
+                                );
                                 let ok = db.execute(
                                     "UPDATE messages SET content = ?1, edited_at = ?2 WHERE id = ?3 AND beam_identity = ?4",
                                     rusqlite::params![content, edited_at, message_id, id],

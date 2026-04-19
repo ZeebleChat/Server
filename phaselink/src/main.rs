@@ -98,6 +98,10 @@ fn create_router(state: Arc<AppState>) -> Router<()> {
             patch(messages::edit_message).delete(messages::delete_message),
         )
         .route(
+            "/v1/messages/:message_id/history",
+            get(messages::get_message_history),
+        )
+        .route(
             "/v1/invites",
             get(invites::list_invites).post(invites::create_invite),
         )
@@ -609,6 +613,15 @@ CREATE TABLE IF NOT EXISTS users (
             view_category INTEGER NOT NULL DEFAULT 1,
             PRIMARY KEY (category_id, role_name)
         );
+
+        CREATE TABLE IF NOT EXISTS message_edit_history (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id  INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            content     TEXT NOT NULL,
+            edited_by   TEXT NOT NULL,
+            edited_at   INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+        CREATE INDEX IF NOT EXISTS idx_edit_history_msg ON message_edit_history(message_id);
 
         INSERT OR IGNORE INTO channels (id, name, topic)
         VALUES ('general', 'general', 'General zeeble-chat for everyone');
