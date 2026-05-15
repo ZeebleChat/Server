@@ -12,7 +12,7 @@ use tracing::{debug, error, info};
 
 use super::{require_auth, AppState};
 
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Category {
     pub id: i64,
     pub name: String,
@@ -41,44 +41,61 @@ pub async fn list_categories(
     if let Err(e) = require_auth(&state, &headers).await {
         return e.into_response();
     }
-    let db = match state.db.lock() {
-        Ok(db) => db,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "DB unavailable" })),
-            )
-                .into_response();
+
+    let mut redis_conn = state.redis.clone();
+
+    // Try Redis cache first
+    if let Some(cached) = crate::cache::cache_get(&mut redis_conn, "categories:list").await {
+        if let Ok(categories) = serde_json::from_str::<Vec<Category>>(&cached) {
+            debug!("list_categories: returning {} categories (cached)", categories.len());
+            return Json(categories).into_response();
+        }
+    }
+
+    // Cache miss — query SQLite (scoped so db/stmt drop before async work)
+    let categories: Vec<Category> = {
+        let db = match state.db.lock() {
+            Ok(db) => db,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "DB unavailable" })),
+                )
+                    .into_response();
+            }
+        };
+        let mut stmt = match db.prepare("SELECT id, name, position FROM categories ORDER BY position ASC, name ASC") {
+            Ok(s) => s,
+            Err(e) => {
+                error!("prepare: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "DB error" })),
+                )
+                    .into_response();
+            }
+        };
+        match stmt.query_map([], |row| {
+            Ok(Category {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                position: row.get(2)?,
+            })
+        }) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e) => {
+                error!("query categories: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "DB error" })),
+                )
+                    .into_response();
+            }
         }
     };
-    let mut stmt = match db.prepare("SELECT id, name, position FROM categories ORDER BY position ASC, name ASC") {
-        Ok(s) => s,
-        Err(e) => {
-            error!("prepare: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "DB error" })),
-            )
-                .into_response();
-        }
-    };
-    let categories: Vec<Category> = match stmt.query_map([], |row| {
-        Ok(Category {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            position: row.get(2)?,
-        })
-    }) {
-        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-        Err(e) => {
-            error!("query categories: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "DB error" })),
-            )
-                .into_response();
-        }
-    };
+    if let Ok(json) = serde_json::to_string(&categories) {
+        crate::cache::cache_set(&mut redis_conn, "categories:list", &json).await;
+    }
     debug!("list_categories: returning {} categories", categories.len());
     Json(categories).into_response()
 }
@@ -144,6 +161,8 @@ pub async fn create_category(
 
             if let Some(cat) = cat {
                 info!("category created: {} by {identity}", cat.name);
+                let mut redis_conn = state.redis.clone();
+                crate::cache::cache_invalidate(&mut redis_conn, "categories:list").await;
                 // Broadcast category creation
                 let server_id = state.settings.read().await.server_name.clone();
                 let broadcast = serde_json::to_string(&json!({
@@ -238,6 +257,8 @@ pub async fn delete_category(
             .into_response(),
         Ok(_) => {
             info!("category deleted: {} by {identity}", cat_name.unwrap_or_default());
+            let mut redis_conn = state.redis.clone();
+            crate::cache::cache_invalidate(&mut redis_conn, "categories:list").await;
             // Broadcast category deletion
             let server_id = state.settings.read().await.server_name.clone();
             let broadcast = serde_json::to_string(&json!({
@@ -361,6 +382,8 @@ pub async fn update_category(
     match update_result {
         Ok((id, name, position)) => {
             info!("category updated: {} by {identity}", name);
+            let mut redis_conn = state.redis.clone();
+            crate::cache::cache_invalidate(&mut redis_conn, "categories:list").await;
             let server_id = state.settings.read().await.server_name.clone();
             let broadcast = serde_json::to_string(&json!({
                 "type": "category_updated",

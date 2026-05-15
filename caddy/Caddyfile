@@ -24,7 +24,13 @@
     @livekit {
         path /rtc /rtc/*
     }
-    reverse_proxy @livekit livekit:7880
+    reverse_proxy @livekit livekit:7880 {
+        flush_interval -1
+        transport http {
+            read_timeout  0
+            write_timeout 0
+        }
+    }
 
     # ── Everything else → PhaseLink REST API ─────────────────────────────────
     reverse_proxy phaselink:4000

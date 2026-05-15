@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-pub const CONFIG_FILE: &str = "phaselink.yaml";
-
 /// The canonical name for the default role — used across permissions, roles, and seeding.
 pub const EVERYONE_ROLE: &str = "@everyone";
 
@@ -52,10 +50,7 @@ pub struct ConfigFile {
     pub port: Option<u16>,
     pub db_path: Option<String>,
     pub auth_server_url: Option<String>,
-    pub livekit_api_url: Option<String>,
-    pub livekit_server_url: Option<String>,
-    pub livekit_api_key: Option<String>,
-    pub livekit_api_secret: Option<String>,
+    pub redis_url: Option<String>,
 
     // ── Hot-reloadable ────────────────────────────
     pub server_name: Option<String>,
@@ -68,6 +63,27 @@ pub struct ConfigFile {
     pub default_invite_max_uses: Option<u64>,
     pub allow_new_members: Option<bool>,
     pub logo_attachment_id: Option<i64>,
+    pub banner_attachment_id: Option<i64>,
+
+    // ── Membership requirements ─────────────────
+    pub require_email_verified: Option<bool>,
+    pub require_phone_verified: Option<bool>,
+    pub require_age_18_plus: Option<bool>,
+    pub age_proof_methods: Option<Vec<String>>,
+
+    // ── Access control ──────────────────────────
+    /// Allow JWT accounts flagged as bots by the auth server. Default: true.
+    pub allow_bots: Option<bool>,
+    /// Minimum account age in days (requires `account_created_at` claim in JWT). 0 = off.
+    pub min_account_age_days: Option<u64>,
+    /// If non-empty, ONLY these beam identities may join (whitelist).
+    pub identity_whitelist: Option<Vec<String>>,
+    /// Beam identities that are always denied, even with a valid invite (blacklist).
+    pub identity_blacklist: Option<Vec<String>>,
+    /// If non-empty, only users whose verified email matches one of these domains may join.
+    pub allowed_email_domains: Option<Vec<String>>,
+    /// Maximum number of members. 0 = unlimited.
+    pub max_members: Option<u64>,
 }
 
 /// Startup-only config (never changes after boot).
@@ -75,14 +91,7 @@ pub struct Config {
     pub port: u16,
     pub db_path: String,
     pub auth_server_url: String,
-    pub livekit_api_url: String,
-    /// Internal URL of the LiveKit server (unused; clients connect directly via
-    /// `livekit_url` from the token response). Kept for backwards compatibility.
-    pub livekit_server_url: String,
-    /// Shared secret sent as `X-Bridge-Secret` to the livekit-api bridge.
-    pub livekit_bridge_secret: String,
-    /// LiveKit API secret (startup-only, used for validation warning at boot).
-    pub livekit_api_secret: String,
+    pub redis_url: String,
     /// Path to the config file that was loaded (or None if not found).
     pub config_path: Option<String>,
     /// Comma-separated list of trusted proxy IPs/CIDRs. Only when the connecting
@@ -97,6 +106,11 @@ pub struct Config {
     pub attachments_dir: Option<String>,
     /// Auto-delete attachments older than N days. 0 = keep forever.
     pub attachment_max_age_days: u64,
+    /// Redis maxmemory limit applied at startup via CONFIG SET.
+    /// "0" or empty = no limit (Redis default).  Accepts human-readable units
+    /// (e.g. "512MB", "2GB").  When set, the eviction policy is also set to
+    /// allkeys-lru so cache entries are dropped before hard OOM.
+    pub redis_max_memory: String,
 }
 
 /// Hot-reloadable settings — read with `state.settings.read().await`.
@@ -113,9 +127,29 @@ pub struct Settings {
     pub default_invite_max_uses: u64,
     pub allow_new_members: bool,
     pub logo_attachment_id: Option<i64>,
+    pub banner_attachment_id: Option<i64>,
     /// Comma-separated list of allowed CORS origins. If empty when evaluated,
     /// the resolver falls back to `public_url` only.
     pub allowed_origins: Vec<String>,
+    // ── Membership requirements ───────────────────────────────────────────────
+    pub require_email_verified: bool,
+    pub require_phone_verified: bool,
+    pub require_age_18_plus: bool,
+    pub age_proof_methods: Vec<String>,
+
+    // ── Access control ────────────────────────────────────────────────────────
+    /// Allow bot-flagged JWT accounts. Default true.
+    pub allow_bots: bool,
+    /// Minimum account age in days. 0 = no requirement.
+    pub min_account_age_days: u64,
+    /// Whitelist: if non-empty, only listed identities can join.
+    pub identity_whitelist: Vec<String>,
+    /// Blacklist: these identities are always denied.
+    pub identity_blacklist: Vec<String>,
+    /// Email domain restriction: if non-empty, only these domains are accepted.
+    pub allowed_email_domains: Vec<String>,
+    /// Maximum member count. 0 = unlimited.
+    pub max_members: u64,
 }
 
 impl Settings {
@@ -180,11 +214,92 @@ impl Settings {
             .and_then(|s| s.parse().ok())
             .or(file.logo_attachment_id);
 
+        let banner_attachment_id = std::env::var("BANNER_ATTACHMENT_ID")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .or(file.banner_attachment_id);
+
         // CORS allowed origins: env var (comma-separated) overrides nothing; always present.
         let allowed_origins = std::env::var("ALLOWED_ORIGINS")
             .ok()
             .map(|s| parse_list(&s))
             .unwrap_or_default();
+
+        let require_email_verified = std::env::var("REQUIRE_EMAIL_VERIFIED")
+            .ok()
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            })
+            .or(file.require_email_verified)
+            .unwrap_or(false);
+
+        let require_phone_verified = std::env::var("REQUIRE_PHONE_VERIFIED")
+            .ok()
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            })
+            .or(file.require_phone_verified)
+            .unwrap_or(false);
+
+        let require_age_18_plus = std::env::var("REQUIRE_AGE_18_PLUS")
+            .ok()
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            })
+            .or(file.require_age_18_plus)
+            .unwrap_or(false);
+
+        let age_proof_methods = std::env::var("AGE_PROOF_METHODS")
+            .ok()
+            .map(|s| parse_list(&s))
+            .or_else(|| file.age_proof_methods.clone())
+            .unwrap_or_else(|| vec!["email".into(), "id".into(), "phone".into()]);
+
+        let allow_bots = std::env::var("ALLOW_BOTS")
+            .ok()
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            })
+            .or(file.allow_bots)
+            .unwrap_or(true);
+
+        let min_account_age_days = std::env::var("MIN_ACCOUNT_AGE_DAYS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .or(file.min_account_age_days)
+            .unwrap_or(0);
+
+        let identity_whitelist = std::env::var("IDENTITY_WHITELIST")
+            .ok()
+            .map(|s| parse_list(&s))
+            .or_else(|| file.identity_whitelist.clone())
+            .unwrap_or_default();
+
+        let identity_blacklist = std::env::var("IDENTITY_BLACKLIST")
+            .ok()
+            .map(|s| parse_list(&s))
+            .or_else(|| file.identity_blacklist.clone())
+            .unwrap_or_default();
+
+        let allowed_email_domains = std::env::var("ALLOWED_EMAIL_DOMAINS")
+            .ok()
+            .map(|s| parse_list(&s))
+            .or_else(|| file.allowed_email_domains.clone())
+            .unwrap_or_default();
+
+        let max_members = std::env::var("MAX_MEMBERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .or(file.max_members)
+            .unwrap_or(0);
 
         Self {
             server_name: std::env::var("SERVER_NAME")
@@ -206,129 +321,46 @@ impl Settings {
             default_invite_max_uses,
             allow_new_members,
             logo_attachment_id,
+            banner_attachment_id,
             allowed_origins,
+            require_email_verified,
+            require_phone_verified,
+            require_age_18_plus,
+            age_proof_methods,
+            allow_bots,
+            min_account_age_days,
+            identity_whitelist,
+            identity_blacklist,
+            allowed_email_domains,
+            max_members,
         }
     }
 }
 
-const CONFIG_EXAMPLE: &str = r#"# ─────────────────────────────────────────────────────────────────────────────
-#  PHASELINK  —  phaselink.yaml
-#
-#  Most settings marked "live" are applied immediately when you save this file.
-#  Settings marked "restart required" only take effect after a server restart.
-#  Environment variables always override values in this file.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ── Network ──────────────────────────────────────────────────────────────────
-# [restart required]
-port: 4000
-
-# Publicly reachable base URL — used in invite links and the join page.
-# Defaults to http://localhost:<port> if not set.
-# [live]
-# public_url: "https://zeeble-chat.example.com"
-
-# ── Storage ───────────────────────────────────────────────────────────────────
-# [restart required]
-db_path: "zeeble.db"
-
-# Maximum size for a single file upload.
-# Supports human-readable units: KB, MB, GB  (e.g. "25MB", "1GB")
-# [live]
-max_upload_size: "8MB"
-
-# ── Chat ──────────────────────────────────────────────────────────────────────
-# Maximum number of characters in a single message.
-# [live]
-max_message_length: 4000
-
-# ── Invites ───────────────────────────────────────────────────────────────────
-# Allow any authenticated user to create invite links.
-# Set to false to restrict invite creation to the server owner only.
-# [live]
-invites_anyone_can_create: true
-
-# Default expiry for new invites, in hours. 0 = never expires.
-# [live]
-default_invite_expiry_hours: 0
-
-# Default max redemptions for new invites. 0 = unlimited.
-# [live]
-default_invite_max_uses: 0
-
-# Set to false to stop new members from joining via invite links.
-# [live]
-allow_new_members: true
-
-# ── Identity ──────────────────────────────────────────────────────────────────
-# Display name shown on invite pages and in /server/info.
-# [live]
-server_name: "Zeeble Server"
-
-# A short description of this server, shown in /server/info.
-# [live]
-# about: "A chill place to hang out."
-"#;
-
 impl Config {
-    /// Load startup config with the following priority (highest → lowest):
-    ///   1. Environment variables
-    ///   2. `phaselink.yaml` (if present)
-    ///   3. Built-in defaults
+    /// Load startup config from environment variables only.
+    /// Loads a `.env` file if present (lowest priority — real env vars win).
     pub fn load() -> (Self, ConfigFile) {
-        // Load .env file if present (lowest priority — real env vars win)
         let _ = dotenvy::dotenv();
 
-        // Try to read and parse phaselink.yaml
-        let (file, config_path) = match std::fs::read_to_string(CONFIG_FILE) {
-            Ok(contents) => {
-                let parsed: ConfigFile = serde_yaml::from_str(&contents)
-                    .unwrap_or_else(|e| panic!("Invalid {CONFIG_FILE}: {e}"));
-                (parsed, Some(CONFIG_FILE.to_string()))
-            }
-            Err(_) => {
-                // File absent — write an example so the user knows what's available
-                if let Err(e) = std::fs::write(CONFIG_FILE, CONFIG_EXAMPLE) {
-                    eprintln!("Warning: could not write example {CONFIG_FILE}: {e}");
-                }
-                (ConfigFile::default(), None)
-            }
-        };
+        let file = ConfigFile::default();
 
         let port: u16 = std::env::var("PORT")
             .ok()
             .and_then(|p| p.parse().ok())
-            .or(file.port)
             .unwrap_or(4000);
 
         let db_path = std::env::var("DB_PATH")
             .ok()
-            .or_else(|| file.db_path.clone())
             .unwrap_or_else(|| "zeeble.db".into());
 
         let auth_server_url = std::env::var("AUTH_SERVER_URL")
             .ok()
-            .or_else(|| file.auth_server_url.clone())
             .unwrap_or_else(|| "http://localhost:3001".into());
 
-        let livekit_api_url = std::env::var("LIVEKIT_API_URL")
+        let redis_url = std::env::var("REDIS_URL")
             .ok()
-            .or_else(|| file.livekit_api_url.clone())
-            .unwrap_or_else(|| "http://localhost:3000".into());
-
-        let livekit_server_url = std::env::var("LIVEKIT_SERVER_URL")
-            .ok()
-            .or_else(|| file.livekit_server_url.clone())
-            .unwrap_or_else(|| "http://livekit:7880".into());
-
-        let livekit_api_secret = std::env::var("LIVEKIT_API_SECRET")
-            .ok()
-            .or_else(|| file.livekit_api_secret.clone())
-            .unwrap_or_default();
-
-        let livekit_bridge_secret = std::env::var("BRIDGE_SECRET")
-            .ok()
-            .unwrap_or_default();
+            .unwrap_or_else(|| "redis://127.0.0.1:6379".into());
 
         let trusted_proxies = std::env::var("TRUSTED_PROXIES")
             .ok()
@@ -337,10 +369,7 @@ impl Config {
 
         let require_tls = std::env::var("REQUIRE_TLS")
             .ok()
-            .and_then(|s| match s.to_lowercase().as_str() {
-                "true" | "1" | "yes" => Some(true),
-                _ => Some(false),
-            })
+            .map(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
             .unwrap_or(false);
 
         let attachments_dir = std::env::var("ATTACHMENTS_DIR")
@@ -352,20 +381,23 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
+        let redis_max_memory = std::env::var("REDIS_MAX_MEMORY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "0".to_string());
+
         (
             Self {
                 port,
                 db_path,
                 auth_server_url,
-                livekit_api_url,
-                livekit_server_url,
-                livekit_bridge_secret,
-                livekit_api_secret,
-                config_path,
+                redis_url,
+                config_path: None,
                 trusted_proxies,
                 require_tls,
                 attachments_dir,
                 attachment_max_age_days,
+                redis_max_memory,
             },
             file,
         )

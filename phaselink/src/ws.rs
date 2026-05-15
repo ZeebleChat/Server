@@ -44,6 +44,36 @@ pub enum WsIncoming {
     },
     Read,
     Ping,
+    StreamFrame {
+        channel_id: String,
+        data: String,
+    },
+    VoiceJoin {
+        channel_id: String,
+    },
+    VoiceLeave {
+        channel_id: String,
+    },
+    VoiceAudio {
+        channel_id: String,
+        data: String,
+    },
+    StreamStart {
+        channel_id: String,
+    },
+    StreamStop {
+        channel_id: String,
+    },
+    StreamLeave {
+        channel_id: String,
+    },
+    StreamAudio {
+        channel_id: String,
+        data: String,
+    },
+    StreamJoin {
+        channel_id: String,
+    },
 }
 
 async fn send_err(socket: &mut WebSocket, msg: &str) {
@@ -79,10 +109,10 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
                 let ws_incoming = match serde_json::from_str::<WsIncoming>(&text) {
                     Ok(ws_in) => ws_in,
-                    Err(_) => {
-                        warn!("malformed WS frame from {:?}", identity);
+                    Err(e) => {
+                        warn!("malformed WS frame from {:?}: {e}", identity);
                         send_err(&mut socket, "Malformed message format").await;
-                        break;
+                        continue;
                     }
                 };
 
@@ -368,6 +398,89 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     WsIncoming::Read { .. } => {
                         debug!("read receipt received");
                         return;
+                    }
+
+                    WsIncoming::StreamFrame { channel_id, data } => {
+                        let id = match &identity {
+                            Some(id) => id.clone(),
+                            None => continue,
+                        };
+                        let broadcast = serde_json::to_string(&json!({
+                            "type": "stream_frame",
+                            "channel_id": channel_id,
+                            "from": id,
+                            "data": data,
+                        })).unwrap();
+                        let _ = state.server_bus.send(broadcast);
+                    }
+
+                    WsIncoming::VoiceJoin { channel_id } => {
+                        let id = match &identity { Some(id) => id.clone(), None => continue };
+                        let _ = state.server_bus.send(serde_json::to_string(&json!({
+                            "type": "voice_state",
+                            "channel_id": channel_id,
+                            "identity": id,
+                            "action": "join",
+                        })).unwrap());
+                    }
+                    WsIncoming::VoiceLeave { channel_id } => {
+                        let id = match &identity { Some(id) => id.clone(), None => continue };
+                        let _ = state.server_bus.send(serde_json::to_string(&json!({
+                            "type": "voice_state",
+                            "channel_id": channel_id,
+                            "identity": id,
+                            "action": "leave",
+                        })).unwrap());
+                    }
+                    WsIncoming::VoiceAudio { channel_id, data } => {
+                        let id = match &identity { Some(id) => id.clone(), None => continue };
+                        let _ = state.bus_for(&channel_id).send(serde_json::to_string(&json!({
+                            "type": "voice_audio",
+                            "channel_id": channel_id,
+                            "from": id,
+                            "data": data,
+                        })).unwrap());
+                    }
+                    WsIncoming::StreamStart { channel_id } => {
+                        let id = match &identity { Some(id) => id.clone(), None => continue };
+                        let _ = state.server_bus.send(serde_json::to_string(&json!({
+                            "type": "stream_start",
+                            "channel_id": channel_id,
+                            "from": id,
+                        })).unwrap());
+                    }
+                    WsIncoming::StreamStop { channel_id } => {
+                        let id = match &identity { Some(id) => id.clone(), None => continue };
+                        let _ = state.server_bus.send(serde_json::to_string(&json!({
+                            "type": "stream_end",
+                            "channel_id": channel_id,
+                            "from": id,
+                        })).unwrap());
+                    }
+                    WsIncoming::StreamLeave { channel_id } => {
+                        let id = match &identity { Some(id) => id.clone(), None => continue };
+                        let _ = state.server_bus.send(serde_json::to_string(&json!({
+                            "type": "stream_leave",
+                            "channel_id": channel_id,
+                            "from": id,
+                        })).unwrap());
+                    }
+                    WsIncoming::StreamAudio { channel_id, data } => {
+                        let id = match &identity { Some(id) => id.clone(), None => continue };
+                        let _ = state.bus_for(&channel_id).send(serde_json::to_string(&json!({
+                            "type": "stream_audio",
+                            "channel_id": channel_id,
+                            "from": id,
+                            "data": data,
+                        })).unwrap());
+                    }
+                    WsIncoming::StreamJoin { channel_id } => {
+                        let id = match &identity { Some(id) => id.clone(), None => continue };
+                        let _ = state.server_bus.send(serde_json::to_string(&json!({
+                            "type": "stream_joined",
+                            "channel_id": channel_id,
+                            "from": id,
+                        })).unwrap());
                     }
                 }
             }

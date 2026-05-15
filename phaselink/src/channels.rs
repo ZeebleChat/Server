@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::*;
 
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Channel {
     pub id: String,
     pub name: String,
@@ -55,50 +55,67 @@ pub async fn list_channels(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    // Fetch all channels first, then drop the DB lock before calling resolve_channel_access
-    let all_channels: Vec<Channel> = {
-        let db = match state.db.lock() {
-            Ok(db) => db,
-            Err(_) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": "DB unavailable" })),
-                )
-                    .into_response();
+
+    let mut redis_conn = state.redis.clone();
+
+    // Try Redis cache first; deserialize failure falls through to SQLite
+    let cached: Option<Vec<Channel>> = crate::cache::cache_get(&mut redis_conn, "channels:list")
+        .await
+        .and_then(|json| serde_json::from_str(&json).ok());
+
+    let all_channels: Vec<Channel> = if let Some(channels) = cached {
+        channels
+    } else {
+        // Cache miss — query SQLite, then populate cache
+        let from_db: Vec<Channel> = {
+            let db = match state.db.lock() {
+                Ok(db) => db,
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "DB unavailable" })),
+                    )
+                        .into_response();
+                }
+            };
+            let mut stmt = match db.prepare("SELECT id, name, topic, type, category_id, position FROM channels ORDER BY position ASC, name ASC") {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("prepare: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "DB error" })),
+                    )
+                        .into_response();
+                }
+            };
+            match stmt.query_map([], |row| {
+                Ok(Channel {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    topic: row.get(2)?,
+                    channel_type: row.get(3)?,
+                    category_id: row.get(4)?,
+                    position: row.get(5)?,
+                })
+            }) {
+                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                Err(e) => {
+                    error!("query channels: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "DB error" })),
+                    )
+                        .into_response();
+                }
             }
-        };
-        let mut stmt = match db.prepare("SELECT id, name, topic, type, category_id, position FROM channels ORDER BY position ASC, name ASC") {
-            Ok(s) => s,
-            Err(e) => {
-                error!("prepare: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": "DB error" })),
-                )
-                    .into_response();
-            }
-        };
-        match stmt.query_map([], |row| {
-            Ok(Channel {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                topic: row.get(2)?,
-                channel_type: row.get(3)?,
-                category_id: row.get(4)?,
-                position: row.get(5)?,
-            })
-        }) {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(e) => {
-                error!("query channels: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": "DB error" })),
-                )
-                    .into_response();
-            }
+        }; // DB lock dropped here
+        if let Ok(json) = serde_json::to_string(&from_db) {
+            crate::cache::cache_set(&mut redis_conn, "channels:list", &json).await;
         }
-    }; // DB lock dropped here
+        from_db
+    };
+
     // Filter channels based on per-role permissions
     let mut visible = Vec::with_capacity(all_channels.len());
     for ch in all_channels {
@@ -168,6 +185,8 @@ pub async fn create_channel(
     match insert_result {
         Ok(_) => {
             info!("channel created: #{id} by {identity}");
+            let mut redis_conn = state.redis.clone();
+            crate::cache::cache_invalidate(&mut redis_conn, "channels:list").await;
             // Broadcast channel creation
             let server_id = state.settings.read().await.server_name.clone();
             let broadcast = serde_json::to_string(&json!({
@@ -264,6 +283,8 @@ pub async fn delete_channel(
             .into_response(),
         Ok(_) => {
             info!("channel deleted: #{channel_id} by {identity}");
+            let mut redis_conn = state.redis.clone();
+            crate::cache::cache_invalidate(&mut redis_conn, "channels:list").await;
             // Broadcast channel deletion
             let server_id = state.settings.read().await.server_name.clone();
             let broadcast = serde_json::to_string(&json!({
@@ -414,6 +435,8 @@ pub async fn rename_channel(
     match update_result {
         Ok((id, name, topic, channel_type, category_id, position)) => {
             info!("channel renamed: #{id} by {identity} → name={name:?} topic={topic:?} type={channel_type:?}");
+            let mut redis_conn = state.redis.clone();
+            crate::cache::cache_invalidate(&mut redis_conn, "channels:list").await;
             let server_id = state.settings.read().await.server_name.clone();
             let broadcast = serde_json::to_string(&json!({
                 "type": "channel_renamed",

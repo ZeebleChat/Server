@@ -14,8 +14,10 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/livekit-server /usr/local/bin/livekit-server
+WORKDIR /app
 
-EXPOSE 3000
+COPY --from=builder /app/target/release/zvoice /usr/local/bin/zvoice
 
-CMD ["livekit-server"]
+CMD ["zvoice"]
+
+EXPOSE 4001

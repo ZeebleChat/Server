@@ -9,8 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use std::sync::Arc;
-use tokio::fs;
-use tracing::error;
+use tracing::warn;
 
 use crate::config::parse_size;
 
@@ -38,6 +37,34 @@ pub struct PatchSettingsRequest {
     allow_new_members: Option<bool>,
     #[serde(default)]
     logo_attachment_id: Option<i64>,
+    #[serde(default)]
+    banner_attachment_id: Option<i64>,
+    // ── Membership requirements ───────────────────────────────────────────────
+    #[serde(default)]
+    require_email_verified: Option<bool>,
+    #[serde(default)]
+    require_phone_verified: Option<bool>,
+    #[serde(default)]
+    require_age_18_plus: Option<bool>,
+    /// Valid values: "email", "id", "phone".  Empty = any method accepted.
+    #[serde(default)]
+    age_proof_methods: Option<Vec<String>>,
+    // ── Access control ────────────────────────────────────────────────────────
+    #[serde(default)]
+    allow_bots: Option<bool>,
+    #[serde(default)]
+    min_account_age_days: Option<u64>,
+    /// Replaces the entire whitelist; null/absent = no change.
+    #[serde(default)]
+    identity_whitelist: Option<Vec<String>>,
+    /// Replaces the entire blacklist; null/absent = no change.
+    #[serde(default)]
+    identity_blacklist: Option<Vec<String>>,
+    /// Replaces the entire domain list; null/absent = no change.
+    #[serde(default)]
+    allowed_email_domains: Option<Vec<String>>,
+    #[serde(default)]
+    max_members: Option<u64>,
 }
 
 pub async fn get_settings(
@@ -79,6 +106,17 @@ pub async fn get_settings(
         "default_invite_max_uses":      settings.default_invite_max_uses,
         "allow_new_members":            settings.allow_new_members,
         "logo_attachment_id":           settings.logo_attachment_id,
+        "banner_attachment_id":         settings.banner_attachment_id,
+        "require_email_verified":       settings.require_email_verified,
+        "require_phone_verified":       settings.require_phone_verified,
+        "require_age_18_plus":          settings.require_age_18_plus,
+        "age_proof_methods":            settings.age_proof_methods,
+        "allow_bots":                   settings.allow_bots,
+        "min_account_age_days":         settings.min_account_age_days,
+        "identity_whitelist":           settings.identity_whitelist,
+        "identity_blacklist":           settings.identity_blacklist,
+        "allowed_email_domains":        settings.allowed_email_domains,
+        "max_members":                  settings.max_members,
     }))
     .into_response()
 }
@@ -104,199 +142,109 @@ pub async fn patch_settings(
             .into_response();
     }
 
-    // Drop read lock, will acquire write lock later
+    // Drop read lock, will acquire write lock below
     drop(current_settings);
 
-    // Load current config file from disk
-    const CONFIG_FILE: &str = "phaselink.yaml";
-    let toml_str = match fs::read_to_string(CONFIG_FILE).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Failed to read config file: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "Cannot read config file" })),
-            )
-                .into_response();
-        }
-    };
+    // Validate fields before acquiring the write lock
 
-    let mut config_file: crate::ConfigFile = match serde_yaml::from_str(&toml_str) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            error!("Failed to parse config file: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "Invalid config file" })),
-            )
-                .into_response();
-        }
-    };
-
-    // Validate fields and update config_file
-
-    // server_name: if Some, must be non-empty
     if let Some(ref name) = payload.server_name {
         if name.trim().is_empty() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "server_name cannot be empty" })),
-            )
-                .into_response();
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "server_name cannot be empty" }))).into_response();
         }
-        config_file.server_name = Some(name.clone());
     }
 
-    // public_url: if Some, must be non-empty (no further validation)
     if let Some(ref url) = payload.public_url {
         if url.trim().is_empty() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "public_url cannot be empty" })),
-            )
-                .into_response();
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "public_url cannot be empty" }))).into_response();
         }
-        config_file.public_url = Some(url.clone());
     }
 
-    // owner_beam_identity is stored in the DB, not the config file — skip here
-
-    // about: if Some, can be any string (including empty?), we'll accept empty.
-    if let Some(ref about) = payload.about {
-        config_file.about = Some(about.clone());
-    }
-
-    // max_message_length: if Some, must be > 0
     if let Some(len) = payload.max_message_length {
         if len == 0 {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "max_message_length must be > 0" })),
-            )
-                .into_response();
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "max_message_length must be > 0" }))).into_response();
         }
-        config_file.max_message_length = Some(len);
     }
 
-    // max_upload_size: if Some, must be parseable and > 0
     if let Some(ref size_str) = payload.max_upload_size {
-        if let Some(size) = parse_size(size_str) {
-            if size == 0 {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": "max_upload_size must be > 0" })),
-                )
-                    .into_response();
+        match parse_size(size_str) {
+            Some(0) | None => {
+                return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Invalid max_upload_size. Use e.g. \"8MB\", \"500KB\"" }))).into_response();
             }
-            config_file.max_upload_size = Some(size_str.clone());
-        } else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "Invalid max_upload_size format. Use e.g., \"8MB\", \"500KB\"" })),
-            )
-            .into_response();
+            _ => {}
         }
     }
 
-    // invites_anyone_can_create
-    if let Some(val) = payload.invites_anyone_can_create {
-        config_file.invites_anyone_can_create = Some(val);
-    }
-
-    // default_invite_expiry_hours
-    if let Some(val) = payload.default_invite_expiry_hours {
-        config_file.default_invite_expiry_hours = Some(val);
-    }
-
-    // default_invite_max_uses
-    if let Some(val) = payload.default_invite_max_uses {
-        config_file.default_invite_max_uses = Some(val);
-    }
-
-    // allow_new_members
-    if let Some(val) = payload.allow_new_members {
-        config_file.allow_new_members = Some(val);
-    }
-
-    // logo_attachment_id: if Some, must be >0 and exist in attachments table
     if let Some(att_id) = payload.logo_attachment_id {
         if att_id <= 0 {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "logo_attachment_id must be positive" })),
-            )
-                .into_response();
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "logo_attachment_id must be positive" }))).into_response();
         }
-        // Check DB
-        let db = match state.db.lock() {
-            Ok(db) => db,
-            Err(_) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": "DB unavailable" })),
-                )
-                    .into_response();
-            }
-        };
-        let exists = match db.prepare("SELECT 1 FROM attachments WHERE id = ?1") {
-            Ok(mut stmt) => match stmt.query_row(rusqlite::params![att_id], |_| Ok(true)) {
-                Ok(_) => true,
-                Err(rusqlite::Error::QueryReturnedNoRows) => false,
+        let exists = {
+            let db = match state.db.lock() {
+                Ok(db) => db,
+                Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
+            };
+            match db.prepare("SELECT 1 FROM attachments WHERE id = ?1") {
+                Ok(mut stmt) => match stmt.query_row(rusqlite::params![att_id], |_| Ok(true)) {
+                    Ok(_) => true,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => false,
+                    Err(e) => {
+                        warn!("query attachment existence: {e}");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Database error" }))).into_response();
+                    }
+                },
                 Err(e) => {
-                    error!("query attachment existence: {e}");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": "Database error" })),
-                    )
-                        .into_response();
+                    warn!("prepare attachment check: {e}");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Database error" }))).into_response();
                 }
-            },
-            Err(e) => {
-                error!("prepare attachment check: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": "Database error" })),
-                )
-                    .into_response();
             }
         };
         if !exists {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "logo_attachment_id does not refer to an existing attachment" })),
-            )
-            .into_response();
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "logo_attachment_id does not refer to an existing attachment" }))).into_response();
         }
-        config_file.logo_attachment_id = Some(att_id);
     }
 
-    // Serialize updated config_file to YAML
-    let toml_content = match serde_yaml::to_string(&config_file) {
-        Ok(content) => content,
-        Err(e) => {
-            error!("Failed to serialize config: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "Failed to serialize config" })),
-            )
-                .into_response();
+    if let Some(att_id) = payload.banner_attachment_id {
+        if att_id <= 0 {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "banner_attachment_id must be positive" }))).into_response();
         }
-    };
-
-    // Write directly to the config file.
-    // Note: atomic rename (write-tmp then rename) fails with EBUSY when the
-    // config file is a Docker bind-mount because the kernel pins the inode.
-    // Direct overwrite is safe here since config writes are infrequent.
-    if let Err(e) = fs::write(CONFIG_FILE, toml_content).await {
-        error!("Failed to write config file: {e}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "Failed to write config file" })),
-        )
-            .into_response();
+        let exists = {
+            let db = match state.db.lock() {
+                Ok(db) => db,
+                Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
+            };
+            match db.prepare("SELECT 1 FROM attachments WHERE id = ?1") {
+                Ok(mut stmt) => match stmt.query_row(rusqlite::params![att_id], |_| Ok(true)) {
+                    Ok(_) => true,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => false,
+                    Err(e) => {
+                        warn!("query attachment existence: {e}");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Database error" }))).into_response();
+                    }
+                },
+                Err(e) => {
+                    warn!("prepare attachment check: {e}");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Database error" }))).into_response();
+                }
+            }
+        };
+        if !exists {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "banner_attachment_id does not refer to an existing attachment" }))).into_response();
+        }
     }
 
-    // Update in-memory settings immediately
+    if let Some(methods) = &payload.age_proof_methods {
+        let valid = ["email", "id", "phone"];
+        for m in methods {
+            if !valid.contains(&m.as_str()) {
+                return (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("Invalid age_proof_method '{m}'. Valid: email, id, phone") }))).into_response();
+            }
+        }
+    }
+
+    // NOTE: settings changed here are in-memory only — they reset on restart.
+    // To make them permanent, set the corresponding env vars in your .env file.
+
+    // Apply changes to in-memory settings
     let mut settings_guard = state.settings.write().await;
 
     // Apply changes directly
@@ -339,6 +287,43 @@ pub async fn patch_settings(
     }
     if let Some(id) = payload.logo_attachment_id {
         settings_guard.logo_attachment_id = Some(id);
+    }
+    if let Some(id) = payload.banner_attachment_id {
+        let _ = state.db.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO server_meta (key, value) VALUES ('banner_attachment_id', ?1)",
+            rusqlite::params![id.to_string()],
+        );
+        settings_guard.banner_attachment_id = Some(id);
+    }
+    if let Some(val) = payload.require_email_verified {
+        settings_guard.require_email_verified = val;
+    }
+    if let Some(val) = payload.require_phone_verified {
+        settings_guard.require_phone_verified = val;
+    }
+    if let Some(val) = payload.require_age_18_plus {
+        settings_guard.require_age_18_plus = val;
+    }
+    if let Some(methods) = payload.age_proof_methods {
+        settings_guard.age_proof_methods = methods;
+    }
+    if let Some(val) = payload.allow_bots {
+        settings_guard.allow_bots = val;
+    }
+    if let Some(days) = payload.min_account_age_days {
+        settings_guard.min_account_age_days = days;
+    }
+    if let Some(list) = payload.identity_whitelist {
+        settings_guard.identity_whitelist = list;
+    }
+    if let Some(list) = payload.identity_blacklist {
+        settings_guard.identity_blacklist = list;
+    }
+    if let Some(list) = payload.allowed_email_domains {
+        settings_guard.allowed_email_domains = list;
+    }
+    if let Some(val) = payload.max_members {
+        settings_guard.max_members = val;
     }
 
     (StatusCode::OK, Json(json!({ "ok": true }))).into_response()

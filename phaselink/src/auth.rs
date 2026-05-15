@@ -36,6 +36,26 @@ pub struct JwksStore {
     pub keys: HashMap<String, PublicKey>,
 }
 
+/// Verification claims extracted from a JWT.
+/// Fields default to `false`/`None` when absent from the token.
+#[derive(Clone, Debug, Default)]
+pub struct UserVerification {
+    pub email_verified: bool,
+    pub phone_verified: bool,
+    /// Government-issued ID verified (implies age).
+    pub id_verified: bool,
+    /// Age confirmed as 18+ by some method.
+    pub age_verified: bool,
+    /// Which method confirmed the age: "email" | "id" | "phone"
+    pub age_verified_by: Option<String>,
+    /// True if the auth server issued this token to a bot account.
+    pub is_bot: bool,
+    /// The user's email address (used for domain-restriction checks).
+    pub email: Option<String>,
+    /// Unix timestamp when the account was created (for min-age-days check).
+    pub account_created_at: Option<u64>,
+}
+
 /// Fetch JWKS from the auth server's `/.well-known/jwks.json`.
 /// Uses `reqwest::blocking` — must be called from `spawn_blocking`.
 pub fn fetch_jwks(auth_url: &str) -> anyhow::Result<JwksStore> {
@@ -81,9 +101,10 @@ pub fn fetch_jwks(auth_url: &str) -> anyhow::Result<JwksStore> {
 
 // ── JWT validation ────────────────────────────────────────────────────────────
 
-/// Validate a JWT token using Ed25519 keys from the in-memory JWKS store.
-/// Returns the `beam_identity` on success, or `None` if invalid/expired.
-pub async fn validate_jwt(token: &str, state: &AppState) -> Option<String> {
+/// Internal: decode and verify a JWT, returning the identity and all
+/// verification claims.  `validate_jwt` and `validate_jwt_with_verification`
+/// are thin wrappers around this function.
+async fn validate_jwt_core(token: &str, state: &AppState) -> Option<(String, UserVerification)> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         warn!("validate_jwt: not 3 parts");
@@ -138,13 +159,22 @@ pub async fn validate_jwt(token: &str, state: &AppState) -> Option<String> {
         beam_identity: Option<String>,
         exp: Option<usize>,
         aud: Option<String>,
+        // Verification claims
+        email_verified: Option<bool>,
+        phone_verified: Option<bool>,
+        id_verified: Option<bool>,
+        age_verified: Option<bool>,
+        age_verified_by: Option<String>,
+        // Access-control claims
+        is_bot: Option<bool>,
+        email: Option<String>,
+        account_created_at: Option<u64>,
     }
     let claims: Claims = match serde_json::from_slice(&payload_bytes) {
         Ok(c) => c,
         Err(e) => { warn!("validate_jwt: claims parse failed: {e}"); return None; }
     };
 
-    // Check expiration
     if let Some(exp) = claims.exp {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -156,26 +186,230 @@ pub async fn validate_jwt(token: &str, state: &AppState) -> Option<String> {
         }
     }
 
-    // Audience check:
-    //   - No `aud` claim  → general auth token, valid on any server.
-    //   - `aud` matches public_url → valid for this server.
-    //   - `aud` for a different server → rejected.
-    let public_url = {
-        let settings = state.settings.read().await;
-        settings.public_url.clone()
-    };
+    // Audience check: no aud = valid everywhere; mismatched aud = rejected.
+    let public_url = state.settings.read().await.public_url.clone();
     if !public_url.is_empty() {
         if let Some(ref aud) = claims.aud {
             let aud_norm = aud.trim_end_matches('/');
             let url_norm = public_url.trim_end_matches('/');
             if aud_norm != url_norm {
-                warn!("validate_jwt: aud mismatch: token aud='{aud_norm}' vs server public_url='{url_norm}'");
+                warn!("validate_jwt: aud mismatch: token aud='{aud_norm}' vs server='{url_norm}'");
                 return None;
             }
         }
     }
 
-    claims.beam_identity.or(claims.sub)
+    let identity = claims.beam_identity.or(claims.sub)?;
+    let verif = UserVerification {
+        email_verified: claims.email_verified.unwrap_or(false),
+        phone_verified: claims.phone_verified.unwrap_or(false),
+        id_verified: claims.id_verified.unwrap_or(false),
+        age_verified: claims.age_verified.unwrap_or(false),
+        age_verified_by: claims.age_verified_by,
+        is_bot: claims.is_bot.unwrap_or(false),
+        email: claims.email,
+        account_created_at: claims.account_created_at,
+    };
+    Some((identity, verif))
+}
+
+/// Validate a JWT and return the caller's `beam_identity`.
+/// Returns `None` if the token is invalid, expired, or fails the audience check.
+pub async fn validate_jwt(token: &str, state: &AppState) -> Option<String> {
+    validate_jwt_core(token, state).await.map(|(id, _)| id)
+}
+
+/// Validate a JWT and return both the identity and its verification claims.
+pub async fn validate_jwt_with_verification(
+    token: &str,
+    state: &AppState,
+) -> Option<(String, UserVerification)> {
+    validate_jwt_core(token, state).await
+}
+
+// ── Membership requirement enforcement ───────────────────────────────────────
+
+/// Check whether a joining user passes all server membership requirements.
+/// Call this at invite-redeem time, before incrementing the invite use count.
+/// The server owner always passes regardless of settings.
+pub async fn check_membership_requirements(
+    state: &AppState,
+    identity: &str,
+    verif: &UserVerification,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let s = state.settings.read().await;
+
+    // Owner is always allowed
+    if !s.owner_beam_identity.is_empty() && identity == s.owner_beam_identity {
+        return Ok(());
+    }
+
+    // ── Blacklist ─────────────────────────────────────────────────────────────
+    if s.identity_blacklist.iter().any(|b| b == identity) {
+        warn!("join blocked: {identity} is on the server blacklist");
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "You are not permitted to join this server.",
+                "requirement": "not_blacklisted"
+            })),
+        ));
+    }
+
+    // ── Whitelist ─────────────────────────────────────────────────────────────
+    if !s.identity_whitelist.is_empty() && !s.identity_whitelist.iter().any(|w| w == identity) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "This server uses an access whitelist. Your account is not on it.",
+                "requirement": "whitelisted"
+            })),
+        ));
+    }
+
+    // ── Bot accounts ──────────────────────────────────────────────────────────
+    if !s.allow_bots && verif.is_bot {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "This server does not allow bot accounts.",
+                "requirement": "no_bots"
+            })),
+        ));
+    }
+
+    // ── Minimum account age ───────────────────────────────────────────────────
+    if s.min_account_age_days > 0 {
+        match verif.account_created_at {
+            None => {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": format!(
+                            "This server requires accounts to be at least {} day(s) old, \
+                             but your account age could not be verified.",
+                            s.min_account_age_days
+                        ),
+                        "requirement": "min_account_age"
+                    })),
+                ));
+            }
+            Some(created_at) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let age_days = now.saturating_sub(created_at) / 86_400;
+                if age_days < s.min_account_age_days {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": format!(
+                                "This server requires accounts to be at least {} day(s) old. \
+                                 Your account is {} day(s) old.",
+                                s.min_account_age_days, age_days
+                            ),
+                            "requirement": "min_account_age",
+                            "required_days": s.min_account_age_days,
+                            "account_age_days": age_days
+                        })),
+                    ));
+                }
+            }
+        }
+    }
+
+    // ── Email domain restriction ──────────────────────────────────────────────
+    if !s.allowed_email_domains.is_empty() {
+        let domain = verif.email.as_deref().and_then(|e| e.split('@').nth(1));
+        let passes = domain
+            .map(|d| s.allowed_email_domains.iter().any(|allowed| allowed.eq_ignore_ascii_case(d)))
+            .unwrap_or(false);
+        if !passes {
+            let list = s.allowed_email_domains.join(", ");
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": format!("This server only allows users from: {list}"),
+                    "requirement": "email_domain"
+                })),
+            ));
+        }
+    }
+
+    // ── Max member cap ────────────────────────────────────────────────────────
+    if s.max_members > 0 {
+        let count: u64 = {
+            let db = state.db.lock().unwrap();
+            db.query_row(
+                "SELECT COUNT(*) FROM users WHERE is_deleted = 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u64
+        };
+        if count >= s.max_members {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "This server has reached its maximum member count.",
+                    "requirement": "max_members"
+                })),
+            ));
+        }
+    }
+
+    // ── Verification requirements ─────────────────────────────────────────────
+    if s.require_email_verified && !verif.email_verified {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "This server requires a verified email address to join.",
+                "requirement": "email_verified"
+            })),
+        ));
+    }
+
+    if s.require_phone_verified && !verif.phone_verified {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "This server requires a verified phone number to join.",
+                "requirement": "phone_verified"
+            })),
+        ));
+    }
+
+    if s.require_age_18_plus {
+        let methods = &s.age_proof_methods;
+        let passes = if methods.is_empty() {
+            verif.age_verified || verif.id_verified
+        } else {
+            methods.iter().any(|m| match m.as_str() {
+                "email" => verif.age_verified && verif.age_verified_by.as_deref() == Some("email"),
+                "id"    => verif.id_verified || (verif.age_verified && verif.age_verified_by.as_deref() == Some("id")),
+                "phone" => verif.age_verified && verif.age_verified_by.as_deref() == Some("phone"),
+                _       => false,
+            })
+        };
+        if !passes {
+            let accepted = if methods.is_empty() {
+                "email, government ID, or phone".to_string()
+            } else {
+                methods.join(", ")
+            };
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": format!("This server requires age verification (18+) via: {accepted}."),
+                    "requirement": "age_18_plus",
+                    "accepted_methods": accepted
+                })),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -238,12 +472,12 @@ pub async fn require_auth(
 
 /// Call the auth server's `/login` endpoint with beam identity + password.
 /// Validates the returned JWT locally before trusting it.
-/// Returns the validated `beam_identity` on success, or an error message.
+/// Returns `(beam_identity, UserVerification)` on success, or an error message.
 pub async fn auth_server_login(
     beam_identity: &str,
     password: &str,
     state: &AppState,
-) -> Result<String, String> {
+) -> Result<(String, UserVerification), String> {
     let login_url = format!("{}/login", state.auth_server_url.trim_end_matches('/'));
 
     let resp = reqwest::Client::new()
@@ -273,8 +507,7 @@ pub async fn auth_server_login(
         .and_then(|v| v.as_str())
         .ok_or_else(|| "auth server returned no token".to_string())?;
 
-    // Validate the returned JWT locally to confirm it's genuine
-    validate_jwt(token, state)
+    validate_jwt_with_verification(token, state)
         .await
         .ok_or_else(|| "token returned by auth server failed local validation".to_string())
 }

@@ -301,10 +301,25 @@ pub async fn redeem_invite(
     Path(code): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let identity = match require_auth(&state, &headers).await {
-        Ok(id) => id,
-        Err(e) => return e.into_response(),
+    // Use validate_jwt_with_verification directly (not require_auth) so that users
+    // who previously left (is_deleted = 1) can still redeem an invite to rejoin.
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let (identity, verification) = match token {
+        Some(t) => match crate::auth::validate_jwt_with_verification(t, &state).await {
+            Some(id_verif) => id_verif,
+            None => return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid or expired token" }))).into_response(),
+        },
+        None => return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Missing token" }))).into_response(),
     };
+
+    // Check membership requirements (blacklist/whitelist/verification/bot/etc.)
+    if let Err(e) = crate::auth::check_membership_requirements(&state, &identity, &verification).await {
+        warn!("invite redeem blocked by membership requirements for {identity}");
+        return e.into_response();
+    }
 
     // Check allow_new_members gate
     if !state.settings.read().await.allow_new_members {
@@ -335,6 +350,15 @@ pub async fn redeem_invite(
     match rows_affected {
         Ok(1) => {
             info!("{identity} redeemed invite {code}");
+            // Re-admit the user: insert if new, or restore if they previously left
+            let _ = db.execute(
+                "INSERT OR IGNORE INTO users (beam_identity, status) VALUES (?1, 'offline')",
+                rusqlite::params![identity],
+            );
+            let _ = db.execute(
+                "UPDATE users SET is_deleted = 0 WHERE beam_identity = ?1",
+                rusqlite::params![identity],
+            );
             Json(json!({ "ok": true })).into_response()
         }
         Ok(0) => {
@@ -503,14 +527,6 @@ pub async fn join_page(
     .error-icon{{font-size:2rem;margin-bottom:10px}}
     .error-title{{font-size:15px;font-weight:700;color:#ef4444;margin-bottom:6px}}
     .error-msg{{font-size:13px;color:#9ca3af}}
-    .form-title{{font-size:14px;font-weight:600;color:#f3f4f6;margin-bottom:4px}}
-    label{{display:block;font-size:12px;font-weight:600;color:#9ca3af;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px}}
-    input{{width:100%;padding:10px 12px;font-size:14px;background:#1b1d21;color:#f3f4f6;border:1px solid rgba(255,255,255,0.1);border-radius:8px;outline:none;transition:border-color 0.15s;margin-bottom:16px;font-family:inherit}}
-    input:focus{{border-color:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,0.2)}}
-    input::placeholder{{color:#6b7280}}
-    #ji-msg{{margin-top:12px;padding:10px 14px;border-radius:8px;font-size:13px;font-weight:500;display:none;align-items:center;gap:8px}}
-    #ji-msg.ok{{background:rgba(16,185,129,0.12);color:#10b981;border:1px solid rgba(16,185,129,0.2);display:flex}}
-    #ji-msg.err{{background:rgba(239,68,68,0.12);color:#ef4444;border:1px solid rgba(239,68,68,0.2);display:flex}}
   </style>
 </head>
 <body>
@@ -553,21 +569,14 @@ function render(inv) {{
       <div class="info-row"><span class="info-label">Code</span><span class="info-value">${{CODE}}</span></div>
     </div>
     <div class="divider"></div>
-    <div class="btn-group">
-      <a class="btn btn-primary" href="zeeble://join?code=${{CODE}}">Open in Zeeble</a>
+    <div id="deep-state">
+      <p class="sub" style="text-align:center;padding:8px 0">Opening Zeeble<span class="dot-anim"></span></p>
+    </div>
+    <div class="btn-group" style="margin-top:16px">
       <button class="btn btn-secondary" onclick="copyLink(this)">Copy invite link</button>
     </div>
-    <div class="divider"></div>
-    <p class="form-title">Sign in to join</p>
-    <p class="sub" style="margin-bottom:16px">Use your Zeeble account — including subaccounts.</p>
-    <label for="ji-id">Beam Identity</label>
-    <input id="ji-id" placeholder="name»tag" autocomplete="username">
-    <label for="ji-pw">Password</label>
-    <input id="ji-pw" type="password" placeholder="••••••••" autocomplete="current-password">
-    <button class="btn btn-primary" id="ji-btn" onclick="joinSubmit()" style="margin-top:4px">Sign in & Join</button>
-    <div id="ji-msg"></div>
   `;
-  document.addEventListener('keydown', e => {{ if (e.key === 'Enter') joinSubmit(); }}, {{once: true}});
+  attemptDeepLink();
 }}
 
 function renderError(msg) {{
@@ -587,54 +596,34 @@ function copyLink(btn) {{
   }});
 }}
 
-async function joinSubmit() {{
-  const id  = document.getElementById('ji-id');
-  const pw  = document.getElementById('ji-pw');
-  const btn = document.getElementById('ji-btn');
-  if (!id || !pw || !btn) return;
-  if (!id.value.trim() || !pw.value) {{ showJoinMsg('err', 'Enter your beam identity and password.'); return; }}
-  btn.disabled = true;
-  btn.textContent = 'Signing in…';
-  try {{
-    const r = await fetch(`${{API_URL}}/join/${{CODE}}`, {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ beam_identity: id.value.trim(), password: pw.value }})
-    }});
-    const d = await r.json();
-    if (r.ok) {{
-      renderJoined(d.identity);
-    }} else {{
-      btn.disabled = false;
-      btn.textContent = 'Sign in & Join';
-      showJoinMsg('err', d.error || 'Failed to join.');
-    }}
-  }} catch {{
-    btn.disabled = false;
-    btn.textContent = 'Sign in & Join';
-    showJoinMsg('err', 'Could not reach the server.');
-  }}
+function attemptDeepLink() {{
+  const deepLink = `zeeble://join?code=${{CODE}}`;
+  let appOpened = false;
+
+  // If the page loses focus the app launched, clear the fallback timer
+  const onHide = () => {{ appOpened = true; }};
+  document.addEventListener('visibilitychange', onHide, {{once: true}});
+
+  // Try to open the app
+  window.location.href = deepLink;
+
+  // After 2 s, if still here the app is not installed
+  setTimeout(() => {{
+    document.removeEventListener('visibilitychange', onHide);
+    if (!appOpened) showDownloadFallback(deepLink);
+  }}, 2000);
 }}
 
-function showJoinMsg(cls, text) {{
-  const el = document.getElementById('ji-msg');
+function showDownloadFallback(deepLink) {{
+  const el = document.getElementById('deep-state');
   if (!el) return;
-  el.className = cls;
-  el.textContent = text;
-}}
-
-function renderJoined(identity) {{
-  document.getElementById('root').innerHTML = `
-    <h2>You've Joined!</h2>
-    <p class="sub">Open the Zeeble app to start chatting.</p>
-    <div class="badge" style="background:rgba(16,185,129,0.1);color:#10b981;border-color:rgba(16,185,129,0.2);margin-top:16px">
-      <div class="dot" style="background:#10b981;box-shadow:0 0 6px rgba(16,185,129,0.6)"></div>Successfully joined
+  el.innerHTML = `
+    <p style="font-size:14px;font-weight:600;color:#f3f4f6;margin-bottom:4px">Don't have Zeeble yet?</p>
+    <p class="sub" style="margin-bottom:16px">Download the app to accept this invite.</p>
+    <div class="btn-group">
+      <a class="btn btn-primary" href="https://github.com/ZeebleChat/Client/releases" target="_blank" rel="noopener">Download Zeeble</a>
+      <a class="btn btn-secondary" href="${{deepLink}}">Already installed? Open app</a>
     </div>
-    <div class="info" style="margin-top:20px">
-      <div class="info-row"><span class="info-label">Signed in as</span><span class="info-value">${{identity}}</span></div>
-    </div>
-    <div class="divider"></div>
-    <a class="btn btn-primary" href="zeeble://join?code=${{CODE}}">Open in Zeeble</a>
   `;
 }}
 
@@ -700,12 +689,18 @@ pub async fn join_redeem(
             .into_response();
     }
 
-    let identity = match auth_server_login(&beam_identity, &password, &state).await {
-        Ok(id) => id,
+    let (identity, verification) = match auth_server_login(&beam_identity, &password, &state).await {
+        Ok(id_verif) => id_verif,
         Err(e) => {
             return (StatusCode::UNAUTHORIZED, Json(json!({ "error": e }))).into_response()
         }
     };
+
+    // Check membership requirements (blacklist/whitelist/verification/bot/etc.)
+    if let Err(e) = crate::auth::check_membership_requirements(&state, &identity, &verification).await {
+        warn!("join_redeem blocked by membership requirements for {identity}");
+        return e.into_response();
+    }
 
     if !state.settings.read().await.allow_new_members {
         return (
@@ -741,7 +736,8 @@ pub async fn join_redeem(
             {
                 let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
                 let _ = db.execute(
-                    "INSERT OR IGNORE INTO users (beam_identity, status) VALUES (?1, 'offline')",
+                    "INSERT INTO users (beam_identity, status) VALUES (?1, 'offline') \
+                     ON CONFLICT(beam_identity) DO UPDATE SET is_deleted = 0, status = 'offline'",
                     rusqlite::params![identity],
                 );
             }

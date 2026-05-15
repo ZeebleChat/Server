@@ -30,6 +30,7 @@ use tower_http::cors::{AllowHeaders, AllowMethods, CorsLayer};
 
 mod auth;
 mod bots;
+mod cache;
 mod categories;
 mod channels;
 mod config;
@@ -39,10 +40,10 @@ mod members;
 mod messages;
 mod openapi;
 mod permissions;
+mod pubsub;
 mod rate_limit;
 mod roles;
 mod server_settings;
-mod voice;
 mod ws;
 
 // Re-export auth helpers so sibling modules can use `crate::validate_jwt` etc.
@@ -50,7 +51,7 @@ pub use auth::{
     auth_server_login, require_auth, resolve_identity,
     validate_bot_token, validate_jwt, JwksStore,
 };
-pub use config::{Config, ConfigFile, Settings, CONFIG_FILE, EVERYONE_ROLE};
+pub use config::{Config, ConfigFile, Settings, EVERYONE_ROLE};
 
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -137,9 +138,6 @@ fn create_router(state: Arc<AppState>) -> Router<()> {
         .route("/v1/attachments/:id", get(files::get_attachment))
         .route("/v1/first-time-setup", post(invites::create_invite))
         .route("/v1/ws", get(ws::ws_handler))
-        .route("/v1/voice/token", get(voice::get_voice_token))
-        .route("/v1/voice/rooms", get(voice::get_voice_rooms))
-        .route("/v1/voice/participants/:channel_id", get(voice::get_voice_participants))
         .route("/v1/server/info", get(server_info))
         .route("/v1/server/settings", get(server_settings::get_settings).patch(server_settings::patch_settings))
         // Bot management (owner only)
@@ -244,6 +242,7 @@ async fn server_info(
         "allow_new_members": s.allow_new_members,
         "invites_anyone": s.invites_anyone_can_create,
         "logo_attachment_id": s.logo_attachment_id,
+        "banner_attachment_id": s.banner_attachment_id,
     }))
 }
 
@@ -297,15 +296,10 @@ pub struct AppState {
     pub online_users: Mutex<HashMap<String, usize>>,
     /// Hot-reloadable settings — read with `state.settings.read().await`.
     pub settings: Arc<tokio::sync::RwLock<Settings>>,
-    /// Server-wide broadcast channel for member/channel updates.
+    /// Server-wide broadcast channel for member/channel updates and voice state events.
     pub server_bus: broadcast::Sender<String>,
-    /// LiveKit API management service URL.
-    pub livekit_api_url: String,
-    /// Shared secret sent as `X-Bridge-Secret` to the livekit-api bridge.
-    pub livekit_bridge_secret: String,
-    /// Internal LiveKit server URL (unused; clients connect directly via
-    /// `livekit_url` from token response). Kept for backwards compatibility.
-    pub livekit_server_url: String,
+    /// Redis connection manager — used for voice room presence and pub/sub events.
+    pub redis: redis::aio::ConnectionManager,
     /// Startup lock — server rejects all client requests until the owner unlocks it.
     pub locked: Arc<AtomicBool>,
     /// Per-IP rate limiting for the /admin/unlock endpoint.
@@ -438,7 +432,7 @@ impl AppState {
                 Err(_) => return,
             };
             let mut stmt = match db.prepare(
-                "SELECT src.beam_identity, COUNT(m.id) as message_count, COALESCE(MAX(u.status), 'offline') as status, MAX(u.role) as role
+                "SELECT src.beam_identity, COUNT(m.id) as message_count, COALESCE(MAX(u.status), 'offline') as status, MAX(u.avatar_attachment_id) as avatar_id, MAX(u.role) as role
              FROM (SELECT beam_identity FROM users UNION SELECT beam_identity FROM messages) src
              LEFT JOIN users u ON u.beam_identity = src.beam_identity
              LEFT JOIN messages m ON m.beam_identity = src.beam_identity
@@ -448,8 +442,8 @@ impl AppState {
                 Ok(s) => s,
                 Err(e) => { error!("prepare members: {e}"); return; }
             };
-            let rows: Vec<(String, i64, String, Option<String>)> = stmt.query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            let rows: Vec<(String, i64, String, Option<i64>, Option<String>)> = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
             })
             .unwrap()
             .filter_map(|r| r.ok())
@@ -469,9 +463,9 @@ impl AppState {
         let hoisted_set: std::collections::HashSet<&str> = hoisted_roles.iter().map(|s| s.as_str()).collect();
         let mut online = Vec::new();
         let mut offline = Vec::new();
-        for (beam_identity, _message_count, status, role) in rows {
+        for (beam_identity, _message_count, status, avatar_id, role) in rows {
             let is_owner = !owner.is_empty() && beam_identity == owner;
-            let member = members::FrontendMember { name: beam_identity, status: status.clone(), role: role.clone(), avatar: None, is_owner };
+            let member = members::FrontendMember { name: beam_identity, status: status.clone(), role: role.clone(), avatar: avatar_id, is_owner };
             if status == "online" {
                 let is_hoisted = role.as_deref().map(|r| hoisted_set.contains(r)).unwrap_or(false);
                 if is_hoisted {
@@ -646,13 +640,22 @@ CREATE TABLE IF NOT EXISTS users (
     run_migration(conn, "category_permissions", "deny",  "ALTER TABLE category_permissions ADD COLUMN deny  TEXT NOT NULL DEFAULT '{}'");
     run_migration(conn, "attachments", "file_path", "ALTER TABLE attachments ADD COLUMN file_path TEXT");
 
-    // Seed default roles (INSERT OR IGNORE = skip if already present)
+    // Seed the @everyone role — this is the only role created automatically.
+    // All other roles (Admin, Mod, etc.) can be created manually in server settings.
     conn.execute_batch(
         "INSERT OR IGNORE INTO custom_roles (name, color, position, hoist, permissions) VALUES
-            ('Admin',     '#ef4444', 0,   1, '{\"administrator\":true,\"manage_roles\":true,\"kick_members\":true,\"ban_members\":true,\"create_invites\":true,\"manage_invites\":true,\"manage_channels\":true,\"manage_server\":true,\"manage_messages\":true,\"manage_nicknames\":true,\"change_nickname\":true}'),
-            ('Mod',       '#f59e0b', 1,   1, '{\"kick_members\":true,\"create_invites\":true,\"manage_messages\":true,\"change_nickname\":true}'),
-            ('VIP',       '#6366f1', 2,   0, '{\"create_invites\":true,\"change_nickname\":true}'),
-            (EVERYONE_ROLE, '#99aab5', 999, 0, '{\"view_channel\":true,\"send_messages\":true,\"read_message_history\":true,\"embed_links\":true,\"attach_files\":true,\"add_reactions\":true,\"create_invites\":true,\"change_nickname\":true,\"connect\":true,\"speak\":true}');"
+            ('@everyone', '#99aab5', 999, 0, '{\"view_channel\":true,\"send_messages\":true,\"read_message_history\":true,\"embed_links\":true,\"attach_files\":true,\"add_reactions\":true,\"create_invites\":true,\"change_nickname\":true,\"connect\":true,\"speak\":true}');"
+    ).ok();
+
+    // Repair @everyone if its permissions are still empty — this happens on
+    // databases that existed before the `permissions` column was added:
+    // the migration sets the column default to '{}', then INSERT OR IGNORE
+    // skips the row because @everyone already exists, leaving it with no perms.
+    conn.execute(
+        "UPDATE custom_roles \
+         SET permissions = '{\"view_channel\":true,\"send_messages\":true,\"read_message_history\":true,\"embed_links\":true,\"attach_files\":true,\"add_reactions\":true,\"create_invites\":true,\"change_nickname\":true,\"connect\":true,\"speak\":true}' \
+         WHERE name = '@everyone' AND (permissions = '{}' OR permissions = '')",
+        [],
     ).ok();
 
     // Seed default "Channels" category and migrate any uncategorized channels into it.
@@ -914,7 +917,7 @@ async fn unlock_server(
             }
             (StatusCode::UNAUTHORIZED, Json(json!({ "error": e }))).into_response()
         }
-        Ok(identity) => {
+        Ok((identity, _)) => {
             let owner = state.settings.read().await.owner_beam_identity.clone();
             if !owner.is_empty() && identity != owner {
                 warn!("unlock rejected: {identity} is not the owner ({owner}) — ip={ip}");
@@ -976,11 +979,7 @@ fn main() {
 
         let port = config.port;
         let db_path = config.db_path.clone();
-        let config_source = config
-            .config_path
-            .clone()
-            .map(|p| format!("{p} (+ env overrides)"))
-            .unwrap_or_else(|| format!("env vars only (example written to {CONFIG_FILE})"));
+        let config_source = "env vars (.env file)";
 
         let mut initial_settings = Settings::from_file(&config_file, port);
 
@@ -1006,6 +1005,19 @@ fn main() {
             }
         }
 
+        // Load banner attachment ID from DB (set via PATCH /v1/server/settings).
+        if initial_settings.banner_attachment_id.is_none() {
+            if let Ok(id_str) = conn.query_row(
+                "SELECT value FROM server_meta WHERE key = 'banner_attachment_id'",
+                [],
+                |row| row.get::<_, String>(0),
+            ) {
+                if let Ok(id) = id_str.parse::<i64>() {
+                    initial_settings.banner_attachment_id = Some(id);
+                }
+            }
+        }
+
         // If an owner is already established (from DB or env), start unlocked.
         // On a fresh install with no owner the server stays locked until the
         // first /admin/unlock call sets the owner.
@@ -1028,6 +1040,37 @@ fn main() {
             invite
         };
 
+        // ── Redis connection ──────────────────────────────────────────────────
+        let redis_client = redis::Client::open(config.redis_url.as_str())
+            .unwrap_or_else(|e| panic!("Invalid REDIS_URL '{}': {e}", config.redis_url));
+        let mut redis_conn = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to connect to Redis at '{}': {e}", config.redis_url));
+        info!("Redis connected: {}", config.redis_url);
+
+        // Apply Redis maxmemory setting if configured
+        if config.redis_max_memory != "0" && !config.redis_max_memory.is_empty() {
+            let mem_result: redis::RedisResult<()> = redis::cmd("CONFIG")
+                .arg("SET")
+                .arg("maxmemory")
+                .arg(&config.redis_max_memory)
+                .query_async(&mut redis_conn)
+                .await;
+            match mem_result {
+                Ok(_) => {
+                    info!("Redis maxmemory set to {}", config.redis_max_memory);
+                    // Use LRU eviction so cache entries are dropped before OOM
+                    let _: redis::RedisResult<()> = redis::cmd("CONFIG")
+                        .arg("SET")
+                        .arg("maxmemory-policy")
+                        .arg("allkeys-lru")
+                        .query_async(&mut redis_conn)
+                        .await;
+                }
+                Err(e) => warn!("Could not set Redis maxmemory to {}: {e}", config.redis_max_memory),
+            }
+        }
+
     let state = Arc::new(AppState {
         db: Mutex::new(conn),
         buses: Arc::new(Mutex::new(HashMap::new())),
@@ -1036,9 +1079,7 @@ fn main() {
         online_users: Mutex::new(HashMap::new()),
         settings: Arc::clone(&settings),
         server_bus,
-        livekit_api_url: config.livekit_api_url.clone(),
-        livekit_bridge_secret: config.livekit_bridge_secret.clone(),
-        livekit_server_url: config.livekit_server_url.clone(),
+        redis: redis_conn,
         locked: Arc::new(AtomicBool::new(!start_unlocked)),
         unlock_attempts: Mutex::new(HashMap::new()),
         bot_rate_limits: Mutex::new(HashMap::new()),
@@ -1065,6 +1106,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+
+        // ── Redis pub/sub listener ────────────────────────────────────────────
+        // Pattern-subscribes to zeeble:* — routes voice events to server_bus,
+        // cross-instance broadcasts to server_bus, and cache invalidations to
+        // the local Redis cache. Reconnects automatically with exponential backoff.
+        pubsub::start(Arc::clone(&state), config.redis_url.clone());
 
         // Print startup banner
         let local_ips = get_local_ips();
@@ -1093,7 +1140,7 @@ fn main() {
         println!("   • WebSocket: {}/ws", public_url.replace("http", "ws"));
         println!("   • Health:    {}/health", public_url);
         println!("   • Join Page: {}/join/{}", public_url, startup_invite);
-        println!("   • LiveKit:   {}", config.livekit_api_url);
+        println!("   • Voice/Stream: handled by zvoice (connect to its /v1/ws endpoint)");
         println!("\n⚡ Server is now running. Press Ctrl+C to stop.");
         println!("   Config changes in phaselink.yaml are applied live — no restart needed.");
         println!("{}", "═".repeat(60));
@@ -1135,7 +1182,7 @@ fn main() {
 
                 match auth_server_login(&beam_identity, &password, &state_for_login).await {
                     Err(e) => println!("   Login failed: {e}"),
-                    Ok(identity) => {
+                    Ok((identity, _)) => {
                         let owner = state_for_login.settings.read().await.owner_beam_identity.clone();
                         if !owner.is_empty() && identity != owner {
                             println!("   Signed in as {identity}, but the owner is {owner}. Try again.");
@@ -1176,108 +1223,6 @@ fn main() {
                 s.invites_anyone_can_create,
                 if s.owner_beam_identity.is_empty() { "<not set>" } else { &s.owner_beam_identity },
             );
-        }
-
-        // ── LiveKit key validation ────────────────────────────────────────────
-        let livekit_secret = std::env::var("LIVEKIT_API_SECRET")
-            .ok()
-            .unwrap_or_else(|| config.livekit_api_secret.clone());
-        if livekit_secret.contains("change-me") || livekit_secret.len() < 32 {
-            eprintln!("\n⚠️  WARNING: LiveKit secret is weak or default.");
-            eprintln!("    Generate a secure string: openssl rand -hex 20");
-            eprintln!("    Or set LIVEKIT_API_SECRET to a value ≥ 32 chars.");
-            if config.require_tls {
-                eprintln!("\n    REQUIRE_TLS is enabled — refusing to start with insecure LiveKit key.");
-                std::process::exit(1);
-            }
-        }
-
-        // ── Config file watcher (notify-based, replaces 2-second polling) ────
-        let settings_arc = Arc::clone(&settings);
-        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<()>(4);
-
-        let mut watcher = {
-            let tx = notify_tx.clone();
-            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                if let Ok(event) = res {
-                    // React to writes/renames (the common save patterns)
-                    if event.kind.is_modify() || matches!(event.kind, notify::EventKind::Create(_)) {
-                        let _ = tx.blocking_send(());
-                    }
-                }
-            })
-        };
-
-        match watcher {
-            Ok(ref mut w) => {
-                use notify::Watcher as _;
-                if let Err(e) = w.watch(
-                    std::path::Path::new(CONFIG_FILE),
-                    notify::RecursiveMode::NonRecursive,
-                ) {
-                    warn!("config watcher: could not watch {CONFIG_FILE}: {e} — falling back to polling");
-                    // Fall back to polling if watch fails (e.g. file doesn't exist yet)
-                    let settings_poll = Arc::clone(&settings_arc);
-                    tokio::spawn(async move {
-                        let mut last = String::new();
-                        loop {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                            if let Ok(contents) = std::fs::read_to_string(CONFIG_FILE) {
-                                if contents != last {
-                                    if let Ok(parsed) = serde_yaml::from_str::<ConfigFile>(&contents) {
-                                        *settings_poll.write().await = Settings::from_file(&parsed, port);
-                                        last = contents;
-                                        info!("config watcher: reloaded {CONFIG_FILE} (poll)");
-                                    }
-                                }
-                            }
-                        }
-                    });
-                } else {
-                    // Notify watcher is active — process events
-                    tokio::spawn(async move {
-                        let _watcher = watcher; // keep alive in this task
-                        while notify_rx.recv().await.is_some() {
-                            // Debounce: drain rapid bursts (e.g. editor writes multiple times)
-                            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-                            while notify_rx.try_recv().is_ok() {}
-
-                            match std::fs::read_to_string(CONFIG_FILE) {
-                                Ok(contents) => match serde_yaml::from_str::<ConfigFile>(&contents) {
-                                    Ok(parsed) => {
-                                        *settings_arc.write().await = Settings::from_file(&parsed, port);
-                                        info!("config watcher: reloaded {CONFIG_FILE}");
-                                    }
-                                    Err(e) => warn!("config watcher: parse error in {CONFIG_FILE}: {e}"),
-                                },
-                                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                                    warn!("config watcher: read error: {e}");
-                                }
-                                _ => {}
-                            }
-                        }
-                    });
-                }
-            }
-            Err(e) => {
-                warn!("config watcher: could not create watcher: {e} — falling back to polling");
-                let settings_poll = Arc::clone(&settings_arc);
-                tokio::spawn(async move {
-                    let mut last = String::new();
-                    loop {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                        if let Ok(contents) = std::fs::read_to_string(CONFIG_FILE) {
-                            if contents != last {
-                                if let Ok(parsed) = serde_yaml::from_str::<ConfigFile>(&contents) {
-                                    *settings_poll.write().await = Settings::from_file(&parsed, port);
-                                    last = contents;
-                                    info!("config watcher: reloaded {CONFIG_FILE} (poll)");
-                                }
-                            }
-                        }
-                    }
-                });
-            }
         }
 
         let app = create_router(state);
