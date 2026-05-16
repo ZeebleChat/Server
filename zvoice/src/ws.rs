@@ -167,6 +167,21 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             Some(id) => {
                                 identity = Some(id.clone());
                                 info!("ws: {id} authenticated");
+
+                                // Send a snapshot of current voice presence so the client
+                                // immediately sees who is in each channel.
+                                let rooms: std::collections::HashMap<String, Vec<String>> = {
+                                    let members = state.voice_members.lock().unwrap();
+                                    members.iter()
+                                        .filter(|(_, v)| !v.is_empty())
+                                        .map(|(ch, ids)| (ch.clone(), ids.iter().cloned().collect()))
+                                        .collect()
+                                };
+                                if !rooms.is_empty() {
+                                    let _ = socket.send(Message::Text(
+                                        serde_json::json!({ "type": "voice_snapshot", "rooms": rooms }).to_string()
+                                    )).await;
+                                }
                             }
                         }
                     }
@@ -318,6 +333,8 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
                         let evt = json!({ "type": "stream_end", "channel_id": channel_id }).to_string();
                         let _ = state.server_bus.send(evt.clone());
+                        // Also push onto the stream bus so viewers on stream_rx receive it.
+                        let _ = state.stream_bus_for(&channel_id).send(evt.clone());
                         redis_publish(&mut r, "zeeble:voice:events", &evt).await;
                         info!("stream: {id} stopped live stream in #{channel_id}");
                     }
@@ -472,6 +489,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             redis_srem(&mut r, "stream:live", channel_id).await;
             let evt = json!({ "type": "stream_end", "channel_id": channel_id }).to_string();
             let _ = state.server_bus.send(evt.clone());
+            let _ = state.stream_bus_for(channel_id).send(evt.clone());
             redis_publish(&mut r, "zeeble:voice:events", &evt).await;
             info!("stream: {id} disconnected — stream in #{channel_id} ended");
         }

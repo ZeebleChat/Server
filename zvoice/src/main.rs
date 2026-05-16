@@ -236,7 +236,7 @@ async fn get_stream(
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap();

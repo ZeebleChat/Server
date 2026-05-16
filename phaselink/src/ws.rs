@@ -95,7 +95,9 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     debug!("ws: new connection established");
     let mut rx: Option<broadcast::Receiver<String>> = None;
     let mut server_rx: Option<broadcast::Receiver<String>> = None;
+    let mut voice_rx: Option<broadcast::Receiver<String>> = None;
     let mut current_channel: Option<String> = None;
+    let mut current_voice_channel: Option<String> = None;
     let mut identity: Option<String> = None;
 
     loop {
@@ -156,7 +158,21 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                         json!({ "type": "activated", "server_id": server_id }).to_string()
                                     ))
                                     .await;
-                                // In standalone mode, activation is a no-op beyond acknowledging.
+
+                                // Send current voice presence snapshot so the client
+                                // can show who's in each voice channel without polling.
+                                let rooms: HashMap<String, Vec<String>> = {
+                                    let members = state.voice_members.lock().unwrap();
+                                    members.iter()
+                                        .filter(|(_, v)| !v.is_empty())
+                                        .map(|(ch, ids)| (ch.clone(), ids.iter().cloned().collect()))
+                                        .collect()
+                                };
+                                if !rooms.is_empty() {
+                                    let _ = socket.send(Message::Text(
+                                        json!({ "type": "voice_snapshot", "rooms": rooms }).to_string()
+                                    )).await;
+                                }
                             }
                         }
                     }
@@ -416,6 +432,25 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
                     WsIncoming::VoiceJoin { channel_id } => {
                         let id = match &identity { Some(id) => id.clone(), None => continue };
+                        // Leave any previous voice channel first.
+                        if let Some(ref old_ch) = current_voice_channel.take() {
+                            let mut members = state.voice_members.lock().unwrap();
+                            if let Some(set) = members.get_mut(old_ch) {
+                                set.remove(&id);
+                                if set.is_empty() { members.remove(old_ch); }
+                            }
+                            drop(members);
+                            let _ = state.server_bus.send(serde_json::to_string(&json!({
+                                "type": "voice_state", "channel_id": old_ch,
+                                "identity": id, "action": "leave",
+                            })).unwrap());
+                        }
+                        {
+                            let mut members = state.voice_members.lock().unwrap();
+                            members.entry(channel_id.clone()).or_default().insert(id.clone());
+                        }
+                        current_voice_channel = Some(channel_id.clone());
+                        voice_rx = Some(state.bus_for(&channel_id).subscribe());
                         let _ = state.server_bus.send(serde_json::to_string(&json!({
                             "type": "voice_state",
                             "channel_id": channel_id,
@@ -425,6 +460,15 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     }
                     WsIncoming::VoiceLeave { channel_id } => {
                         let id = match &identity { Some(id) => id.clone(), None => continue };
+                        {
+                            let mut members = state.voice_members.lock().unwrap();
+                            if let Some(set) = members.get_mut(&channel_id) {
+                                set.remove(&id);
+                                if set.is_empty() { members.remove(&channel_id); }
+                            }
+                        }
+                        current_voice_channel = None;
+                        voice_rx = None;
                         let _ = state.server_bus.send(serde_json::to_string(&json!({
                             "type": "voice_state",
                             "channel_id": channel_id,
@@ -451,11 +495,15 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     }
                     WsIncoming::StreamStop { channel_id } => {
                         let id = match &identity { Some(id) => id.clone(), None => continue };
-                        let _ = state.server_bus.send(serde_json::to_string(&json!({
+                        let evt = serde_json::to_string(&json!({
                             "type": "stream_end",
                             "channel_id": channel_id,
                             "from": id,
-                        })).unwrap());
+                        })).unwrap();
+                        // server_bus for clients subscribed via Activate,
+                        // bus_for for clients receiving frames via the channel bus.
+                        let _ = state.server_bus.send(evt.clone());
+                        let _ = state.bus_for(&channel_id).send(evt);
                     }
                     WsIncoming::StreamLeave { channel_id } => {
                         let id = match &identity { Some(id) => id.clone(), None => continue };
@@ -500,6 +548,20 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 if socket.send(Message::Text(broadcast)).await.is_err() { break; }
             }
             Some(broadcast) = async {
+                match voice_rx.as_mut() {
+                    Some(r) => match r.recv().await {
+                        Ok(m) => Some(m),
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("client lagged, dropped {n} voice audio frames"); None
+                        }
+                        Err(_) => None,
+                    },
+                    None => std::future::pending::<Option<String>>().await,
+                }
+            } => {
+                if socket.send(Message::Text(broadcast)).await.is_err() { break; }
+            }
+            Some(broadcast) = async {
                 match server_rx.as_mut() {
                     Some(r) => match r.recv().await {
                         Ok(m) => Some(m),
@@ -520,6 +582,20 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
     if let Some(ref id) = identity {
         state.mark_offline(id).await;
+
+        // Remove from any voice channel they were in.
+        if let Some(ref ch) = current_voice_channel {
+            let mut members = state.voice_members.lock().unwrap();
+            if let Some(set) = members.get_mut(ch) {
+                set.remove(id);
+                if set.is_empty() { members.remove(ch); }
+            }
+            drop(members);
+            let _ = state.server_bus.send(serde_json::to_string(&json!({
+                "type": "voice_state", "channel_id": ch,
+                "identity": id, "action": "leave",
+            })).unwrap());
+        }
     }
     info!(
         "{} disconnected",

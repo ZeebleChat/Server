@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -316,6 +316,8 @@ pub struct AppState {
     pub require_tls: bool,
     /// IP-based and user-based rate limiting store for sensitive endpoints.
     pub rate_limits: Arc<rate_limit::RateLimitStore>,
+    /// In-memory voice presence: channel_id → set of identities currently in that channel.
+    pub voice_members: Arc<Mutex<HashMap<String, HashSet<String>>>>,
 }
 
 /// Extract the correct client IP for rate-limiting purposes.
@@ -963,7 +965,7 @@ async fn unlock_server(
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -1087,6 +1089,7 @@ fn main() {
         trusted_proxies: config.trusted_proxies.clone(),
         require_tls: config.require_tls,
         rate_limits: Arc::new(rate_limit::RateLimitStore::new()),
+        voice_members: Arc::new(Mutex::new(HashMap::new())),
     });
 
         // Fetch JWKS — use spawn_blocking because reqwest::blocking can't run
