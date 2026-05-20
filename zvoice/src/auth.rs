@@ -35,7 +35,7 @@ pub struct JwksStore {
     pub keys: HashMap<String, PublicKey>,
 }
 
-pub fn fetch_jwks(auth_url: &str) -> anyhow::Result<JwksStore> {
+pub async fn fetch_jwks(auth_url: &str) -> anyhow::Result<JwksStore> {
     if let Ok(b64) = std::env::var("AUTH_PUBLIC_KEY_B64") {
         let bytes = URL_SAFE_NO_PAD
             .decode(b64)
@@ -50,13 +50,23 @@ pub fn fetch_jwks(auth_url: &str) -> anyhow::Result<JwksStore> {
         return Ok(store);
     }
 
+    // Ensure the URL has a scheme — defensively add https:// if missing.
+    let auth_url = if auth_url.starts_with("http://") || auth_url.starts_with("https://") {
+        auth_url.to_string()
+    } else {
+        format!("https://{auth_url}")
+    };
     let jwks_url = format!("{}/.well-known/jwks.json", auth_url.trim_end_matches('/'));
-    let client = reqwest::blocking::Client::new();
-    let resp = client.get(&jwks_url).send()?;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&jwks_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await?;
     if !resp.status().is_success() {
         return Err(anyhow::anyhow!("Failed to fetch JWKS: HTTP {}", resp.status()));
     }
-    let jwks: JwksResponse = resp.json()?;
+    let jwks: JwksResponse = resp.json().await?;
 
     let mut store = JwksStore { keys: HashMap::new() };
     for key in jwks.keys {

@@ -92,7 +92,8 @@ pub struct Config {
     pub db_path: String,
     pub auth_server_url: String,
     pub redis_url: String,
-    /// Path to the config file that was loaded (or None if not found).
+    /// Path to phaselink.yaml that was loaded (None if file not found).
+    /// Settings changes made via the API are written back here.
     pub config_path: Option<String>,
     /// Comma-separated list of trusted proxy IPs/CIDRs. Only when the connecting
     /// socket IP matches one of these will `X-Forwarded-For` / `X-Real-IP` be
@@ -338,12 +339,22 @@ impl Settings {
 }
 
 impl Config {
-    /// Load startup config from environment variables only.
-    /// Loads a `.env` file if present (lowest priority — real env vars win).
+    /// Load startup config.
+    /// Priority (highest → lowest): real env vars → .env file → phaselink.yaml.
+    /// Writes settings changes made via the API back to phaselink.yaml.
     pub fn load() -> (Self, ConfigFile) {
         let _ = dotenvy::dotenv();
 
-        let file = ConfigFile::default();
+        // Try to load phaselink.yaml (or CONFIG_PATH override).
+        let yaml_path = std::env::var("CONFIG_PATH")
+            .unwrap_or_else(|_| "/data/phaselink.yaml".to_string());
+        let (file, config_path) = match std::fs::read_to_string(&yaml_path) {
+            Ok(contents) => {
+                let parsed: ConfigFile = serde_yaml::from_str(&contents).unwrap_or_default();
+                (parsed, Some(yaml_path))
+            }
+            Err(_) => (ConfigFile::default(), None),
+        };
 
         let port: u16 = std::env::var("PORT")
             .ok()
@@ -356,7 +367,7 @@ impl Config {
 
         let auth_server_url = std::env::var("AUTH_SERVER_URL")
             .ok()
-            .unwrap_or_else(|| "http://localhost:3001".into());
+            .unwrap_or_else(|| "https://api.zeeble.xyz".into());
 
         let redis_url = std::env::var("REDIS_URL")
             .ok()
@@ -392,7 +403,7 @@ impl Config {
                 db_path,
                 auth_server_url,
                 redis_url,
-                config_path: None,
+                config_path,
                 trusted_proxies,
                 require_tls,
                 attachments_dir,
@@ -401,6 +412,50 @@ impl Config {
             },
             file,
         )
+    }
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Convert the live in-memory settings back into a ConfigFile suitable for
+/// serialising to phaselink.yaml.  Startup-only fields (port, db_path, …)
+/// are intentionally left as None so they stay in the .env file.
+pub fn settings_to_config_file(s: &Settings) -> ConfigFile {
+    let max_upload_size = {
+        let b = s.max_upload_bytes;
+        if b % (1024 * 1024 * 1024) == 0 { format!("{}GB", b / (1024 * 1024 * 1024)) }
+        else if b % (1024 * 1024) == 0    { format!("{}MB", b / (1024 * 1024)) }
+        else if b % 1024 == 0             { format!("{}KB", b / 1024) }
+        else                              { format!("{}B", b) }
+    };
+    ConfigFile {
+        // Startup-only — keep in .env, not yaml
+        port: None,
+        db_path: None,
+        auth_server_url: None,
+        redis_url: None,
+        // Hot-reloadable
+        server_name:                Some(s.server_name.clone()),
+        public_url:                 Some(s.public_url.clone()),
+        about:                      s.about.clone(),
+        max_message_length:         Some(s.max_message_length),
+        max_upload_size:            Some(max_upload_size),
+        invites_anyone_can_create:  Some(s.invites_anyone_can_create),
+        default_invite_expiry_hours: Some(s.default_invite_expiry_hours),
+        default_invite_max_uses:    Some(s.default_invite_max_uses),
+        allow_new_members:          Some(s.allow_new_members),
+        logo_attachment_id:         s.logo_attachment_id,
+        banner_attachment_id:       s.banner_attachment_id,
+        require_email_verified:     Some(s.require_email_verified),
+        require_phone_verified:     Some(s.require_phone_verified),
+        require_age_18_plus:        Some(s.require_age_18_plus),
+        age_proof_methods:          Some(s.age_proof_methods.clone()),
+        allow_bots:                 Some(s.allow_bots),
+        min_account_age_days:       Some(s.min_account_age_days),
+        identity_whitelist:  if s.identity_whitelist.is_empty()   { None } else { Some(s.identity_whitelist.clone()) },
+        identity_blacklist:  if s.identity_blacklist.is_empty()   { None } else { Some(s.identity_blacklist.clone()) },
+        allowed_email_domains: if s.allowed_email_domains.is_empty() { None } else { Some(s.allowed_email_domains.clone()) },
+        max_members:                Some(s.max_members),
     }
 }
 

@@ -5,7 +5,7 @@ services:
     environment:
       PORT: 4000
       DB_PATH: /data/zeeble.db
-      AUTH_SERVER_URL: ${AUTH_SERVER_URL:-http://host.docker.internal:3001}
+      AUTH_SERVER_URL: ${AUTH_SERVER_URL:-https://api.zeeble.xyz}
       OWNER_BEAM_IDENTITY: ${OWNER_BEAM_IDENTITY:-}
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8081}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
@@ -27,7 +27,7 @@ services:
     build: zvoice/
     environment:
       PORT: 4001
-      AUTH_SERVER_URL: ${AUTH_SERVER_URL:-http://host.docker.internal:3001}
+      AUTH_SERVER_URL: ${AUTH_SERVER_URL:-https://api.zeeble.xyz}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
       RUST_LOG: zvoice=info,tower_http=debug

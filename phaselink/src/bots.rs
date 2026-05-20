@@ -61,7 +61,7 @@ pub async fn require_bot_auth(
     };
 
     let result = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.get().expect("db pool");
         db.query_row(
             "SELECT id, name FROM bots WHERE token = ?1",
             rusqlite::params![token],
@@ -111,7 +111,7 @@ pub async fn create_bot(
     let token = gen_hex(32);
 
     let result = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.get().expect("db pool");
         db.execute(
             "INSERT INTO bots (id, name, token, created_by) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![id, name, token, identity],
@@ -147,7 +147,7 @@ pub async fn list_bots(
     }
 
     let bots: Vec<Value> = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.get().expect("db pool");
         let mut stmt = db
             .prepare(
                 "SELECT id, name, created_by, created_at FROM bots ORDER BY created_at ASC",
@@ -180,7 +180,7 @@ pub async fn delete_bot(
     }
 
     let deleted = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.get().expect("db pool");
         db.execute("DELETE FROM bots WHERE id = ?1", rusqlite::params![bot_id])
             .unwrap_or(0)
     };
@@ -253,7 +253,7 @@ pub async fn bot_send_message(
     }
 
     let exists = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.get().expect("db pool");
         db.query_row(
             "SELECT 1 FROM channels WHERE id = ?1",
             rusqlite::params![channel_id],
@@ -276,7 +276,7 @@ pub async fn bot_send_message(
         .as_secs() as i64;
 
     let msg_id = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.get().expect("db pool");
         db.execute(
             "INSERT INTO messages (channel_id, beam_identity, content, created_at, bot_id) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![channel_id, beam_identity, content, created_at, bot_id],
@@ -313,7 +313,7 @@ pub async fn bot_get_messages(
     }
 
     let messages: Vec<Value> = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.get().expect("db pool");
         let mut stmt = db
             .prepare(
                 "SELECT id, beam_identity, content, created_at, edited_at

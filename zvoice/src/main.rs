@@ -256,7 +256,7 @@ fn main() {
             .unwrap_or(4001);
 
         let auth_server_url = std::env::var("AUTH_SERVER_URL")
-            .unwrap_or_else(|_| "http://localhost:3001".into());
+            .unwrap_or_else(|_| "https://api.zeeble.xyz".into());
 
         let redis_url = std::env::var("REDIS_URL")
             .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
@@ -291,17 +291,33 @@ fn main() {
 
         // ── Fetch JWKS ────────────────────────────────────────────────────────
         let auth_url_for_jwks = auth_server_url.clone();
-        match tokio::task::spawn_blocking(move || auth::fetch_jwks(&auth_url_for_jwks))
-            .await
-            .unwrap()
-        {
+        match auth::fetch_jwks(&auth_url_for_jwks).await {
             Ok(jwks_store) => {
                 *state.jwks.lock().unwrap() = jwks_store;
                 info!("JWKS fetched from {auth_server_url}");
             }
             Err(e) => {
-                eprintln!("FATAL: Failed to fetch JWKS from auth server: {e}");
-                std::process::exit(1);
+                eprintln!("WARNING: Could not fetch JWKS from {auth_server_url}: {e}");
+                eprintln!("         Voice service will start and retry in the background.");
+                let jwks_arc = Arc::clone(&state.jwks);
+                let retry_url = auth_url_for_jwks.clone();
+                tokio::spawn(async move {
+                    let mut delay = std::time::Duration::from_secs(5);
+                    loop {
+                        tokio::time::sleep(delay).await;
+                        match auth::fetch_jwks(&retry_url).await {
+                            Ok(store) => {
+                                *jwks_arc.lock().unwrap() = store;
+                                eprintln!("INFO: JWKS loaded from {retry_url}");
+                                break;
+                            }
+                            Err(e) => {
+                                eprintln!("WARNING: JWKS retry failed ({e}), retrying in {}s…", delay.as_secs());
+                                delay = (delay * 2).min(std::time::Duration::from_secs(120));
+                            }
+                        }
+                    }
+                });
             }
         }
 

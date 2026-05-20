@@ -24,7 +24,7 @@ async fn check_owner_or_admin(
     if is_owner {
         return Ok(true);
     }
-    let db = state.db.lock().map_err(|_| {
+    let db = state.db.get().map_err(|_| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" })))
     })?;
     let is_admin = matches!(
@@ -66,7 +66,7 @@ pub async fn list_roles(
         Err(e) => return e.into_response(),
     }
 
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
     };
@@ -104,7 +104,7 @@ pub async fn set_role(
         Err(e) => return e.into_response(),
     }
 
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
     };
@@ -165,7 +165,7 @@ pub async fn delete_role(
         Err(e) => return e.into_response(),
     }
 
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
     };
@@ -224,7 +224,7 @@ pub async fn list_custom_roles(
     if let Err(e) = require_auth(&state, &headers).await {
         return e.into_response();
     }
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
     };
@@ -278,7 +278,7 @@ pub async fn create_custom_role(
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Color must be a hex value like #rrggbb" }))).into_response();
     }
 
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
     };
@@ -342,7 +342,7 @@ pub async fn update_custom_role(
         }
     }
 
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
     };
@@ -409,7 +409,7 @@ pub async fn delete_custom_role(
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "@everyone cannot be deleted" }))).into_response();
     }
 
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
     };
@@ -445,7 +445,7 @@ pub async fn reorder_custom_roles(
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Only the server owner can reorder roles" }))).into_response();
     }
 
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
     };

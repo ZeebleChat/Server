@@ -144,7 +144,7 @@ pub async fn upload_file(
             .into_response();
     }
 
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => {
             return (
@@ -268,7 +268,7 @@ pub async fn get_attachment(
         }
     };
 
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => {
             return (

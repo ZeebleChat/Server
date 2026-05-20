@@ -57,8 +57,7 @@ pub struct UserVerification {
 }
 
 /// Fetch JWKS from the auth server's `/.well-known/jwks.json`.
-/// Uses `reqwest::blocking` — must be called from `spawn_blocking`.
-pub fn fetch_jwks(auth_url: &str) -> anyhow::Result<JwksStore> {
+pub async fn fetch_jwks(auth_url: &str) -> anyhow::Result<JwksStore> {
     // Test override: if AUTH_PUBLIC_KEY_B64 is set, use that as the sole JWKS key
     if let Ok(b64) = std::env::var("AUTH_PUBLIC_KEY_B64") {
         let bytes = URL_SAFE_NO_PAD
@@ -75,13 +74,23 @@ pub fn fetch_jwks(auth_url: &str) -> anyhow::Result<JwksStore> {
         return Ok(store);
     }
 
+    // Ensure the URL has a scheme — defensively add https:// if missing.
+    let auth_url = if auth_url.starts_with("http://") || auth_url.starts_with("https://") {
+        auth_url.to_string()
+    } else {
+        format!("https://{auth_url}")
+    };
     let jwks_url = format!("{}/.well-known/jwks.json", auth_url.trim_end_matches('/'));
-    let client = reqwest::blocking::Client::new();
-    let resp = client.get(&jwks_url).send()?;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&jwks_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await?;
     if !resp.status().is_success() {
         return Err(anyhow::anyhow!("Failed to fetch JWKS: HTTP {}", resp.status()));
     }
-    let jwks: JwksResponse = resp.json()?;
+    let jwks: JwksResponse = resp.json().await?;
 
     let mut store = JwksStore { keys: HashMap::new() };
     for key in jwks.keys {
@@ -104,7 +113,7 @@ pub fn fetch_jwks(auth_url: &str) -> anyhow::Result<JwksStore> {
 /// Internal: decode and verify a JWT, returning the identity and all
 /// verification claims.  `validate_jwt` and `validate_jwt_with_verification`
 /// are thin wrappers around this function.
-async fn validate_jwt_core(token: &str, state: &AppState) -> Option<(String, UserVerification)> {
+async fn validate_jwt_core(token: &str, state: &AppState) -> Option<(String, UserVerification, Option<String>)> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         warn!("validate_jwt: not 3 parts");
@@ -169,6 +178,8 @@ async fn validate_jwt_core(token: &str, state: &AppState) -> Option<(String, Use
         is_bot: Option<bool>,
         email: Option<String>,
         account_created_at: Option<u64>,
+        // Avatar
+        avatar_attachment_id: Option<String>,
     }
     let claims: Claims = match serde_json::from_slice(&payload_bytes) {
         Ok(c) => c,
@@ -210,13 +221,13 @@ async fn validate_jwt_core(token: &str, state: &AppState) -> Option<(String, Use
         email: claims.email,
         account_created_at: claims.account_created_at,
     };
-    Some((identity, verif))
+    Some((identity, verif, claims.avatar_attachment_id))
 }
 
 /// Validate a JWT and return the caller's `beam_identity`.
 /// Returns `None` if the token is invalid, expired, or fails the audience check.
 pub async fn validate_jwt(token: &str, state: &AppState) -> Option<String> {
-    validate_jwt_core(token, state).await.map(|(id, _)| id)
+    validate_jwt_core(token, state).await.map(|(id, _, _)| id)
 }
 
 /// Validate a JWT and return both the identity and its verification claims.
@@ -224,7 +235,7 @@ pub async fn validate_jwt_with_verification(
     token: &str,
     state: &AppState,
 ) -> Option<(String, UserVerification)> {
-    validate_jwt_core(token, state).await
+    validate_jwt_core(token, state).await.map(|(id, v, _)| (id, v))
 }
 
 // ── Membership requirement enforcement ───────────────────────────────────────
@@ -340,7 +351,7 @@ pub async fn check_membership_requirements(
     // ── Max member cap ────────────────────────────────────────────────────────
     if s.max_members > 0 {
         let count: u64 = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.get().expect("db pool");
             db.query_row(
                 "SELECT COUNT(*) FROM users WHERE is_deleted = 0",
                 [],
@@ -435,7 +446,7 @@ pub async fn require_auth(
     if let Some(id) = id {
         // Phase 2.2: Check if user is deleted
         let is_deleted: bool = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.get().expect("db pool");
             db.query_row(
                 "SELECT is_deleted FROM users WHERE beam_identity = ?1",
                 rusqlite::params![&id],
@@ -515,7 +526,7 @@ pub async fn auth_server_login(
 /// Validate a raw bot token string against the database.
 /// Returns `"bot:<name>"` on success, or `None` if the token is invalid.
 pub async fn validate_bot_token(raw_token: &str, state: &AppState) -> Option<String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.get().expect("db pool");
     db.query_row(
         "SELECT name FROM bots WHERE token = ?1",
         rusqlite::params![raw_token],
@@ -532,6 +543,16 @@ pub async fn resolve_identity(token: &str, state: &Arc<AppState>) -> Option<Stri
         validate_bot_token(bot_token, state).await
     } else {
         validate_jwt(token, state).await
+    }
+}
+
+/// Like `resolve_identity` but also returns the avatar UUID from the JWT claims.
+/// Bots don't carry an avatar, so they always return `None` for the avatar.
+pub async fn resolve_identity_with_avatar(token: &str, state: &Arc<AppState>) -> Option<(String, Option<String>)> {
+    if let Some(bot_token) = token.strip_prefix("Bot ") {
+        validate_bot_token(bot_token, state).await.map(|id| (id, None))
+    } else {
+        validate_jwt_core(token, state).await.map(|(id, _, avatar)| (id, avatar))
     }
 }
 

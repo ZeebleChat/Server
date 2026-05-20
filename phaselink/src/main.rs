@@ -16,6 +16,8 @@ use axum::{
     routing::{delete, get, patch, post, put},
 };
 use rusqlite::{Connection, ToSql};
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -30,6 +32,8 @@ use tower_http::cors::{AllowHeaders, AllowMethods, CorsLayer};
 
 mod auth;
 mod bots;
+#[cfg(test)]
+mod tests;
 mod cache;
 mod categories;
 mod channels;
@@ -56,7 +60,7 @@ pub use config::{Config, ConfigFile, Settings, EVERYONE_ROLE};
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
-fn create_router(state: Arc<AppState>) -> Router<()> {
+pub fn create_router(state: Arc<AppState>) -> Router<()> {
     // Routes that are always accessible, even when the server is locked.
     let open_routes = Router::<()>::new()
         .route(
@@ -134,7 +138,8 @@ fn create_router(state: Arc<AppState>) -> Router<()> {
             "/v1/custom_roles/:name",
             put(roles::update_custom_role).delete(roles::delete_custom_role),
         )
-        .route("/v1/upload", post(files::upload_file))
+        .route("/v1/upload", post(files::upload_file)
+            .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024)))
         .route("/v1/attachments/:id", get(files::get_attachment))
         .route("/v1/first-time-setup", post(invites::create_invite))
         .route("/v1/ws", get(ws::ws_handler))
@@ -185,7 +190,7 @@ fn create_router(state: Arc<AppState>) -> Router<()> {
         .merge(openapi_router)
         .fallback(|| async { (StatusCode::NOT_FOUND, "Not Found") })
         .layer(CompressionLayer::new())
-        .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(1 * 1024 * 1024))
         .layer(axum::extract::Extension(state.clone()))
         .layer(cors_layer)
         .layer(axum::middleware::from_fn(security_headers))
@@ -219,7 +224,7 @@ async fn server_info(
     let s = state.settings.read().await;
 
     let channels: Vec<Value> = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.get().expect("db pool");
         let mut stmt = db.prepare("SELECT id, name, topic FROM channels").unwrap();
         stmt.query_map([], |row| {
             Ok(json!({
@@ -288,8 +293,10 @@ const UNLOCK_MAX_ATTEMPTS: u32 = 5;
 /// How long (seconds) the lockout window lasts.
 const UNLOCK_WINDOW_SECS: u64 = 15 * 60;
 
+pub type DbPool = Pool<SqliteConnectionManager>;
+
 pub struct AppState {
-    pub db: Mutex<Connection>,
+    pub db: DbPool,
     pub buses: ChannelBus,
     pub jwks: Arc<Mutex<JwksStore>>,
     pub auth_server_url: String,
@@ -318,6 +325,8 @@ pub struct AppState {
     pub rate_limits: Arc<rate_limit::RateLimitStore>,
     /// In-memory voice presence: channel_id → set of identities currently in that channel.
     pub voice_members: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// Path to phaselink.yaml — used by PATCH /v1/server/settings to persist changes.
+    pub config_path: Option<String>,
 }
 
 /// Extract the correct client IP for rate-limiting purposes.
@@ -417,7 +426,7 @@ impl AppState {
 
     fn set_user_status_in_db(&self, identity: &str, status: &str) {
         debug!("presence: {identity} → {status}");
-        let db = match self.db.lock() {
+        let db = match self.db.get() {
             Ok(db) => db,
             Err(_) => return,
         };
@@ -427,9 +436,20 @@ impl AppState {
         );
     }
 
+    pub fn set_user_avatar_in_db(&self, identity: &str, avatar: &str) {
+        let db = match self.db.get() {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+        let _ = db.execute(
+            "INSERT INTO users (beam_identity, status, avatar_attachment_id) VALUES (?1, 'offline', ?2) ON CONFLICT(beam_identity) DO UPDATE SET avatar_attachment_id = excluded.avatar_attachment_id",
+            rusqlite::params![identity, avatar],
+        );
+    }
+
     pub async fn broadcast_member_update(&self) {
         let (rows, hoisted_roles) = {
-            let db = match self.db.lock() {
+            let db = match self.db.get() {
                 Ok(db) => db,
                 Err(_) => return,
             };
@@ -444,7 +464,7 @@ impl AppState {
                 Ok(s) => s,
                 Err(e) => { error!("prepare members: {e}"); return; }
             };
-            let rows: Vec<(String, i64, String, Option<i64>, Option<String>)> = stmt.query_map([], |row| {
+            let rows: Vec<(String, i64, String, Option<String>, Option<String>)> = stmt.query_map([], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
             })
             .unwrap()
@@ -568,7 +588,7 @@ pub fn setup_db(conn: &Connection) {
 CREATE TABLE IF NOT EXISTS users (
       beam_identity TEXT PRIMARY KEY,
       status TEXT NOT NULL DEFAULT 'offline',
-      avatar_attachment_id INTEGER,
+      avatar_attachment_id TEXT,
       role TEXT,
       is_deleted INTEGER NOT NULL DEFAULT 0
     );
@@ -626,7 +646,9 @@ CREATE TABLE IF NOT EXISTS users (
     .expect("DB setup failed");
 
     // Run column migrations, adding new columns to existing tables as needed.
-    run_migration(conn, "users", "avatar_attachment_id", "ALTER TABLE users ADD COLUMN avatar_attachment_id INTEGER");
+    run_migration(conn, "users", "avatar_attachment_id", "ALTER TABLE users ADD COLUMN avatar_attachment_id TEXT");
+    // Clear any stale integer avatar IDs left over from before migration 0017 (zbeam now uses UUIDs).
+    conn.execute("UPDATE users SET avatar_attachment_id = NULL WHERE typeof(avatar_attachment_id) = 'integer'", []).ok();
     run_migration(conn, "users", "role",                 "ALTER TABLE users ADD COLUMN role TEXT");
     run_migration(conn, "channels", "type",              "ALTER TABLE channels ADD COLUMN type TEXT DEFAULT 'text'");
     run_migration(conn, "channels", "category_id",       "ALTER TABLE channels ADD COLUMN category_id INTEGER");
@@ -937,10 +959,12 @@ async fn unlock_server(
             state.unlock_attempts.lock().unwrap().remove(&ip);
             // First unlock: persist this identity as the server owner
             if owner.is_empty() {
-                let _ = state.db.lock().unwrap().execute(
-                    "INSERT OR IGNORE INTO server_meta (key, value) VALUES ('owner_beam_identity', ?1)",
-                    rusqlite::params![&identity],
-                );
+                if let Ok(db) = state.db.get() {
+                    let _ = db.execute(
+                        "INSERT OR IGNORE INTO server_meta (key, value) VALUES ('owner_beam_identity', ?1)",
+                        rusqlite::params![&identity],
+                    );
+                }
                 state.settings.write().await.owner_beam_identity = identity.clone();
                 info!("owner identity set to {identity} via first unlock (ip={ip})");
             }
@@ -981,41 +1005,54 @@ fn main() {
 
         let port = config.port;
         let db_path = config.db_path.clone();
-        let config_source = "env vars (.env file)";
+        let config_source = match &config.config_path {
+            Some(p) => format!("phaselink.yaml ({})", p),
+            None    => "env vars / .env only (no phaselink.yaml found)".to_string(),
+        };
 
         let mut initial_settings = Settings::from_file(&config_file, port);
 
         let server_name = initial_settings.server_name.clone();
         let public_url  = initial_settings.public_url.clone();
 
-        let mut conn = Connection::open(&config.db_path)
-            .unwrap_or_else(|e| panic!("Failed to open DB at {}: {e}", config.db_path));
-        info!("database opened: {}", config.db_path);
-        setup_db(&conn);
+        let manager = SqliteConnectionManager::file(&config.db_path);
+        let pool: DbPool = r2d2::Pool::builder()
+            .max_size(8)
+            .build(manager)
+            .unwrap_or_else(|e| panic!("Failed to open DB pool at {}: {e}", config.db_path));
+        info!("database pool opened: {}", config.db_path);
+
+        {
+            let conn = pool.get().expect("DB init connection");
+            setup_db(&conn);
+        }
         debug!("database schema initialized");
 
         // Load owner identity from DB (populated on first unlock).
         // Only applies if not already overridden by OWNER_BEAM_IDENTITY env var.
-        if initial_settings.owner_beam_identity.is_empty() {
-            if let Ok(owner) = conn.query_row(
-                "SELECT value FROM server_meta WHERE key = 'owner_beam_identity'",
-                [],
-                |row| row.get::<_, String>(0),
-            ) {
-                info!("owner identity loaded from database: {}", owner);
-                initial_settings.owner_beam_identity = owner;
+        {
+            let conn = pool.get().expect("DB startup read");
+            if initial_settings.owner_beam_identity.is_empty() {
+                if let Ok(owner) = conn.query_row(
+                    "SELECT value FROM server_meta WHERE key = 'owner_beam_identity'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) {
+                    info!("owner identity loaded from database: {}", owner);
+                    initial_settings.owner_beam_identity = owner;
+                }
             }
-        }
 
-        // Load banner attachment ID from DB (set via PATCH /v1/server/settings).
-        if initial_settings.banner_attachment_id.is_none() {
-            if let Ok(id_str) = conn.query_row(
-                "SELECT value FROM server_meta WHERE key = 'banner_attachment_id'",
-                [],
-                |row| row.get::<_, String>(0),
-            ) {
-                if let Ok(id) = id_str.parse::<i64>() {
-                    initial_settings.banner_attachment_id = Some(id);
+            // Load banner attachment ID from DB (set via PATCH /v1/server/settings).
+            if initial_settings.banner_attachment_id.is_none() {
+                if let Ok(id_str) = conn.query_row(
+                    "SELECT value FROM server_meta WHERE key = 'banner_attachment_id'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) {
+                    if let Ok(id) = id_str.parse::<i64>() {
+                        initial_settings.banner_attachment_id = Some(id);
+                    }
                 }
             }
         }
@@ -1031,9 +1068,9 @@ fn main() {
         let settings = Arc::new(tokio::sync::RwLock::new(initial_settings));
         let (server_bus, _) = broadcast::channel(256);
 
-        // Create a one-time startup invite (reuses the existing connection).
-        // Must happen BEFORE `conn` is moved into `AppState`.
+        // Create a one-time startup invite.
         let startup_invite = {
+            let mut conn = pool.get().expect("startup invite connection");
             let invite = create_startup_invite(&mut conn);
             println!("\n🎟️  STARTUP INVITE (one-time use, stored in DB):");
             println!("   • Code:      {}", invite);
@@ -1074,7 +1111,7 @@ fn main() {
         }
 
     let state = Arc::new(AppState {
-        db: Mutex::new(conn),
+        db: pool,
         buses: Arc::new(Mutex::new(HashMap::new())),
         jwks: Arc::new(Mutex::new(JwksStore { keys: HashMap::new() })),
         auth_server_url: config.auth_server_url.clone(),
@@ -1090,23 +1127,41 @@ fn main() {
         require_tls: config.require_tls,
         rate_limits: Arc::new(rate_limit::RateLimitStore::new()),
         voice_members: Arc::new(Mutex::new(HashMap::new())),
+        config_path: config.config_path.clone(),
     });
 
-        // Fetch JWKS — use spawn_blocking because reqwest::blocking can't run
-        // inside an existing Tokio runtime.
+        // Fetch JWKS from the auth server.  If it fails (e.g. auth server not
+        // reachable yet), start a background task that retries until it succeeds.
+        // The server starts immediately — auth requests return 401 until JWKS loads.
         let auth_url_for_jwks = config.auth_server_url.clone();
-        match tokio::task::spawn_blocking(move || auth::fetch_jwks(&auth_url_for_jwks))
-            .await
-            .unwrap()
-        {
+        match auth::fetch_jwks(&auth_url_for_jwks).await {
             Ok(jwks_store) => {
                 *state.jwks.lock().unwrap() = jwks_store;
                 info!("JWKS fetched successfully from {}", config.auth_server_url);
             }
             Err(e) => {
-                eprintln!("FATAL: Failed to fetch JWKS from auth server: {e}");
-                eprintln!("The server cannot validate tokens without JWKS. Exiting.");
-                std::process::exit(1);
+                eprintln!("WARNING: Could not fetch JWKS from {}: {e}", config.auth_server_url);
+                eprintln!("         Server will start anyway and retry in the background.");
+                eprintln!("         Authenticated requests will fail until JWKS loads.");
+                let jwks_arc = Arc::clone(&state.jwks);
+                let retry_url = auth_url_for_jwks.clone();
+                tokio::spawn(async move {
+                    let mut delay = std::time::Duration::from_secs(5);
+                    loop {
+                        tokio::time::sleep(delay).await;
+                        match auth::fetch_jwks(&retry_url).await {
+                            Ok(store) => {
+                                *jwks_arc.lock().unwrap() = store;
+                                eprintln!("INFO: JWKS loaded successfully from {retry_url}");
+                                break;
+                            }
+                            Err(e) => {
+                                eprintln!("WARNING: JWKS retry failed ({e}), retrying in {}s…", delay.as_secs());
+                                delay = (delay * 2).min(std::time::Duration::from_secs(120));
+                            }
+                        }
+                    }
+                });
             }
         }
 
@@ -1126,7 +1181,7 @@ fn main() {
         println!("   • Port:        {}", port);
         println!("   • Public URL:  {}", public_url);
         println!("   • Database:    {}", db_path);
-        println!("   • Config:      {}", config_source);
+        println!("   • Config:      {}", &config_source);
         println!("\n🌐 LOCAL NETWORK ACCESS:");
         for ip in &local_ips {
             if ip.starts_with("localhost") {
@@ -1192,10 +1247,12 @@ fn main() {
                         } else {
                             // First login: persist as owner
                             if owner.is_empty() {
-                                let _ = state_for_login.db.lock().unwrap().execute(
-                                    "INSERT OR IGNORE INTO server_meta (key, value) VALUES ('owner_beam_identity', ?1)",
-                                    rusqlite::params![&identity],
-                                );
+                                if let Ok(db) = state_for_login.db.get() {
+                                    let _ = db.execute(
+                                        "INSERT OR IGNORE INTO server_meta (key, value) VALUES ('owner_beam_identity', ?1)",
+                                        rusqlite::params![&identity],
+                                    );
+                                }
                                 state_for_login.settings.write().await.owner_beam_identity = identity.clone();
                                 info!("owner identity set to {identity} via first terminal login");
                             }

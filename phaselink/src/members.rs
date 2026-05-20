@@ -5,6 +5,15 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+#[derive(Deserialize)]
+pub struct MembersQuery {
+    #[serde(default = "default_members_limit")]
+    pub limit: usize,
+    pub after: Option<String>,
+}
+
+fn default_members_limit() -> usize { 100 }
+
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdateStatusBody {
     pub status: String,
@@ -17,7 +26,7 @@ pub struct FrontendMember {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub avatar: Option<i64>,
+    pub avatar: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_owner: bool,
 }
@@ -28,17 +37,19 @@ pub struct MemberCategory {
     pub users: Vec<FrontendMember>,
 }
 
-/// GET /members  — list all unique users who have ever posted, sorted by message count
+/// GET /members  — list members, sorted by message count.
+/// Supports `?limit=N&after=<beam_identity>` for cursor-based pagination.
 pub async fn get_members(
     headers: HeaderMap,
     Extension(state): Extension<Arc<AppState>>,
+    Query(q): Query<MembersQuery>,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers).await {
         return e.into_response();
     }
     let owner = state.settings.read().await.owner_beam_identity.clone();
     let (rows, hoisted_roles) = {
-        let db = match state.db.lock() {
+        let db = match state.db.get() {
             Ok(db) => db,
             Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
         };
@@ -61,7 +72,7 @@ pub async fn get_members(
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB error" }))).into_response();
             }
         };
-        let rows: Vec<(String, i64, String, Option<i64>, Option<String>)> = stmt
+        let rows: Vec<(String, i64, String, Option<String>, Option<String>)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
             .unwrap()
             .filter_map(|r| r.ok())
@@ -75,13 +86,33 @@ pub async fn get_members(
         (rows, hoisted)
     };
 
+    // Apply cursor + limit before categorising.
+    // rows is already sorted by message_count DESC so the cursor is stable.
+    let limit = q.limit.min(500).max(1);
+    let mut flat: Vec<(String, i64, String, Option<String>, Option<String>)> = {
+        let mut it = rows.into_iter().peekable();
+        if let Some(after) = &q.after {
+            // Skip until we pass the cursor identity.
+            while let Some((id, ..)) = it.peek() {
+                if id == after { it.next(); break; }
+                it.next();
+            }
+        }
+        it.take(limit + 1).collect()
+    };
+    let has_more = flat.len() > limit;
+    flat.truncate(limit);
+    let next_cursor = if has_more { flat.last().map(|(id, ..)| id.clone()) } else { None };
+
+    debug!("get_members: {} returned (limit={limit}, has_more={has_more})", flat.len());
+
     let mut hoisted_groups: Vec<(String, Vec<FrontendMember>)> =
         hoisted_roles.iter().map(|n| (n.clone(), Vec::new())).collect();
     let hoisted_set: std::collections::HashSet<&str> = hoisted_roles.iter().map(|s| s.as_str()).collect();
     let mut online = Vec::new();
     let mut offline = Vec::new();
 
-    for (beam_identity, _message_count, status, avatar_id, role) in rows {
+    for (beam_identity, _message_count, status, avatar_id, role) in flat {
         let is_owner = !owner.is_empty() && beam_identity == owner;
         let member = FrontendMember {
             name: beam_identity,
@@ -101,7 +132,6 @@ pub async fn get_members(
         } else { offline.push(member); }
     }
 
-    debug!("get_members: {} online, {} offline", online.len(), offline.len());
     let mut categories = Vec::new();
     for (role_name, users) in hoisted_groups {
         if !users.is_empty() {
@@ -115,7 +145,11 @@ pub async fn get_members(
         categories.push(MemberCategory { category: "Offline".to_string(), users: offline });
     }
 
-    Json(categories).into_response()
+    Json(json!({
+        "members": categories,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+    })).into_response()
 }
 
 /// DELETE /v1/members/:identity — leave the server (soft-delete the user record)
@@ -138,7 +172,7 @@ pub async fn delete_member(
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Owner cannot leave; delete the server instead" }))).into_response();
     }
 
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
     };
@@ -176,7 +210,7 @@ pub async fn update_status(
             .into_response();
     }
 
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => {
             return (

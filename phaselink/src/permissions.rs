@@ -141,7 +141,7 @@ pub async fn resolve_channel_access(
         return all_true();
     }
 
-    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+    let db = state.db.get().expect("db pool");
 
     // Look up member's assigned role
     let user_role: Option<String> = db
@@ -239,7 +239,7 @@ pub async fn list_channel_perms(
     if require_auth(&state, &headers).await.is_err() {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Unauthorized" }))).into_response();
     }
-    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+    let db = state.db.get().expect("db pool");
     let mut stmt = match db.prepare(
         "SELECT role_name, allow, deny FROM channel_permissions WHERE channel_id = ?1 ORDER BY role_name",
     ) {
@@ -279,7 +279,7 @@ pub async fn set_channel_perm(
     }
     let allow = serde_json::to_string(&body.allow.unwrap_or_default()).unwrap_or_else(|_| "{}".into());
     let deny  = serde_json::to_string(&body.deny.unwrap_or_default()).unwrap_or_else(|_| "{}".into());
-    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+    let db = state.db.get().expect("db pool");
     match db.execute(
         "INSERT INTO channel_permissions (channel_id, role_name, allow, deny) \
          VALUES (?1, ?2, ?3, ?4) \
@@ -308,7 +308,7 @@ pub async fn delete_channel_perm(
     if identity != owner {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Owner only" }))).into_response();
     }
-    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+    let db = state.db.get().expect("db pool");
     match db.execute(
         "DELETE FROM channel_permissions WHERE channel_id = ?1 AND role_name = ?2",
         rusqlite::params![channel_id, role_name],
@@ -332,7 +332,7 @@ pub async fn list_category_perms(
     if require_auth(&state, &headers).await.is_err() {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Unauthorized" }))).into_response();
     }
-    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+    let db = state.db.get().expect("db pool");
     let mut stmt = match db.prepare(
         "SELECT role_name, allow, deny FROM category_permissions WHERE category_id = ?1 ORDER BY role_name",
     ) {
@@ -372,7 +372,7 @@ pub async fn set_category_perm(
     }
     let allow = serde_json::to_string(&body.allow.unwrap_or_default()).unwrap_or_else(|_| "{}".into());
     let deny  = serde_json::to_string(&body.deny.unwrap_or_default()).unwrap_or_else(|_| "{}".into());
-    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+    let db = state.db.get().expect("db pool");
     match db.execute(
         "INSERT INTO category_permissions (category_id, role_name, allow, deny) \
          VALUES (?1, ?2, ?3, ?4) \
@@ -401,7 +401,7 @@ pub async fn delete_category_perm(
     if identity != owner {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Owner only" }))).into_response();
     }
-    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+    let db = state.db.get().expect("db pool");
     match db.execute(
         "DELETE FROM category_permissions WHERE category_id = ?1 AND role_name = ?2",
         rusqlite::params![category_id, role_name],

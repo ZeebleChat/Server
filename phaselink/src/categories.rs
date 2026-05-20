@@ -54,7 +54,7 @@ pub async fn list_categories(
 
     // Cache miss — query SQLite (scoped so db/stmt drop before async work)
     let categories: Vec<Category> = {
-        let db = match state.db.lock() {
+        let db = match state.db.get() {
             Ok(db) => db,
             Err(_) => {
                 return (
@@ -127,7 +127,7 @@ pub async fn create_category(
             .into_response();
     }
     let insert_result = {
-        let db = match state.db.lock() {
+        let db = match state.db.get() {
             Ok(db) => db,
             Err(_) => {
                 return (
@@ -145,7 +145,7 @@ pub async fn create_category(
     match insert_result {
         Ok(_) => {
             let cat = {
-                let db = state.db.lock().unwrap();
+                let db = state.db.get().expect("db pool");
                 let mut stmt = db.prepare("SELECT id, name, position FROM categories WHERE name = ?1").unwrap();
                 let mut rows = stmt.query(rusqlite::params![name]).unwrap();
                 if let Ok(Some(row)) = rows.next() {
@@ -221,13 +221,13 @@ pub async fn delete_category(
     }
     // First, get the category name for logging
     let cat_name: Option<String> = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.get().expect("db pool");
         db.query_row("SELECT name FROM categories WHERE id = ?1", rusqlite::params![category_id], |row| row.get(0))
             .ok()
     };
 
     let delete_result = {
-        let db = match state.db.lock() {
+        let db = match state.db.get() {
             Ok(db) => db,
             Err(_) => {
                 return (
@@ -318,7 +318,7 @@ pub async fn update_category(
     }
 
     let update_result = {
-        let db = match state.db.lock() {
+        let db = match state.db.get() {
             Ok(db) => db,
             Err(_) => {
                 return (
@@ -357,7 +357,7 @@ pub async fn update_category(
         match result {
             Ok(0) => Err("Category not found"),
             Ok(_) => {
-                let db = state.db.lock().unwrap();
+                let db = state.db.get().expect("db pool");
                 let mut stmt = db
                     .prepare("SELECT id, name, position FROM categories WHERE id = ?1")
                     .unwrap();

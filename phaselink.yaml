@@ -1,5 +1,7 @@
-port: 4000
-db_path: zeeble.db
+port: null
+db_path: null
+auth_server_url: null
+redis_url: null
 server_name: Zeeble Server
 public_url: http://198.160.26.90:8081
 about: null
@@ -10,3 +12,17 @@ default_invite_expiry_hours: 0
 default_invite_max_uses: 0
 allow_new_members: true
 logo_attachment_id: 1
+banner_attachment_id: 12
+require_email_verified: false
+require_phone_verified: false
+require_age_18_plus: false
+age_proof_methods:
+- email
+- id
+- phone
+allow_bots: true
+min_account_age_days: 0
+identity_whitelist: null
+identity_blacklist: null
+allowed_email_domains: null
+max_members: 0

@@ -11,7 +11,7 @@ use serde_json::json;
 use std::sync::Arc;
 use tracing::warn;
 
-use crate::config::parse_size;
+use crate::config::{parse_size, settings_to_config_file};
 
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct PatchSettingsRequest {
@@ -179,7 +179,7 @@ pub async fn patch_settings(
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": "logo_attachment_id must be positive" }))).into_response();
         }
         let exists = {
-            let db = match state.db.lock() {
+            let db = match state.db.get() {
                 Ok(db) => db,
                 Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
             };
@@ -208,7 +208,7 @@ pub async fn patch_settings(
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": "banner_attachment_id must be positive" }))).into_response();
         }
         let exists = {
-            let db = match state.db.lock() {
+            let db = match state.db.get() {
                 Ok(db) => db,
                 Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
             };
@@ -233,10 +233,10 @@ pub async fn patch_settings(
     }
 
     if let Some(methods) = &payload.age_proof_methods {
-        let valid = ["email", "id", "phone"];
+        let valid = ["email", "id", "phone", "gmail"];
         for m in methods {
             if !valid.contains(&m.as_str()) {
-                return (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("Invalid age_proof_method '{m}'. Valid: email, id, phone") }))).into_response();
+                return (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("Invalid age_proof_method '{m}'. Valid: email, id, phone, gmail") }))).into_response();
             }
         }
     }
@@ -256,7 +256,7 @@ pub async fn patch_settings(
     }
     if let Some(id) = payload.owner_beam_identity {
         // Persist to DB (source of truth for owner identity)
-        let _ = state.db.lock().unwrap().execute(
+        let _ = state.db.get().expect("db pool").execute(
             "INSERT OR REPLACE INTO server_meta (key, value) VALUES ('owner_beam_identity', ?1)",
             rusqlite::params![&id],
         );
@@ -289,7 +289,7 @@ pub async fn patch_settings(
         settings_guard.logo_attachment_id = Some(id);
     }
     if let Some(id) = payload.banner_attachment_id {
-        let _ = state.db.lock().unwrap().execute(
+        let _ = state.db.get().expect("db pool").execute(
             "INSERT OR REPLACE INTO server_meta (key, value) VALUES ('banner_attachment_id', ?1)",
             rusqlite::params![id.to_string()],
         );
@@ -324,6 +324,20 @@ pub async fn patch_settings(
     }
     if let Some(val) = payload.max_members {
         settings_guard.max_members = val;
+    }
+
+    // Persist the updated settings to phaselink.yaml so they survive a restart.
+    if let Some(ref path) = state.config_path {
+        let config_file = settings_to_config_file(&settings_guard);
+        drop(settings_guard); // release write lock before file I/O
+        match serde_yaml::to_string(&config_file) {
+            Ok(yaml) => {
+                if let Err(e) = std::fs::write(path, &yaml) {
+                    warn!("failed to write phaselink.yaml: {e}");
+                }
+            }
+            Err(e) => warn!("failed to serialize settings: {e}"),
+        }
     }
 
     (StatusCode::OK, Json(json!({ "ok": true }))).into_response()

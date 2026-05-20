@@ -68,7 +68,7 @@ pub async fn list_channels(
     } else {
         // Cache miss — query SQLite, then populate cache
         let from_db: Vec<Channel> = {
-            let db = match state.db.lock() {
+            let db = match state.db.get() {
                 Ok(db) => db,
                 Err(_) => {
                     return (
@@ -160,7 +160,7 @@ pub async fn create_channel(
             .into_response();
     }
     let insert_result = {
-        let db = match state.db.lock() {
+        let db = match state.db.get() {
             Ok(db) => db,
             Err(_) => {
                 return (
@@ -255,7 +255,7 @@ pub async fn delete_channel(
             .into_response();
     }
     let delete_result = {
-        let db = match state.db.lock() {
+        let db = match state.db.get() {
             Ok(db) => db,
             Err(_) => {
                 return (
@@ -351,7 +351,7 @@ pub async fn rename_channel(
     }
 
     let update_result = {
-        let db = match state.db.lock() {
+        let db = match state.db.get() {
             Ok(db) => db,
             Err(_) => {
                 return (
@@ -406,7 +406,7 @@ pub async fn rename_channel(
         match result {
             Ok(0) => Err("Channel not found"),
             Ok(_) => {
-                let db = state.db.lock().unwrap();
+                let db = state.db.get().expect("db pool");
                 let mut stmt = db
                     .prepare("SELECT id, name, topic, type, category_id, position FROM channels WHERE id = ?1")
                     .unwrap();

@@ -204,7 +204,7 @@ pub async fn get_messages(
         )
         .into_response();
     }
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => {
             return (
@@ -280,7 +280,7 @@ pub async fn create_message(
         .into_response();
     }
 
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => {
             return (
@@ -370,7 +370,7 @@ pub async fn edit_message(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => {
             return (
@@ -444,7 +444,7 @@ pub async fn get_message_history(
 
     // Get channel_id first (drop lock before async perm check)
     let channel_id: String = {
-        let db = match state.db.lock() {
+        let db = match state.db.get() {
             Ok(db) => db,
             Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
         };
@@ -463,7 +463,7 @@ pub async fn get_message_history(
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "No permission" }))).into_response();
     }
 
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
     };
@@ -511,7 +511,7 @@ pub async fn get_board_posts(
     if !perms.get("view_channel").copied().unwrap_or(false) {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "No permission" }))).into_response();
     }
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
     };
@@ -586,7 +586,7 @@ pub async fn get_post_replies(
         Ok(v) => v,
         Err(_) => return Json(Vec::<ChatMessage>::new()).into_response(),
     };
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
     };
@@ -654,7 +654,7 @@ pub async fn delete_message(
         Err(e) => return e.into_response(),
     };
 
-    let db = match state.db.lock() {
+    let db = match state.db.get() {
         Ok(db) => db,
         Err(_) => {
             return (

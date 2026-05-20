@@ -124,15 +124,18 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         let _ = socket.send(Message::Text(json!({ "type": "pong" }).to_string())).await;
                     }
                     WsIncoming::Auth { token } => {
-                        match resolve_identity(&token, &state).await {
+                        match crate::auth::resolve_identity_with_avatar(&token, &state).await {
                             None => {
                                 warn!("ws: auth failed (invalid/expired token)");
                                 send_err(&mut socket, "Invalid or expired token").await;
                                 break;
                             }
-                            Some(id) => {
+                            Some((id, avatar)) => {
                                 let was_unauth = identity.is_none();
                                 identity = Some(id.clone());
+                                if let Some(av) = avatar {
+                                    state.set_user_avatar_in_db(&id, &av);
+                                }
                                 if was_unauth {
                                     state.mark_online(&id);
                                     info!("ws: {id} authenticated and marked online");
@@ -187,7 +190,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                     state.mark_online(&id);
                                 }
                                 let exists = {
-                                    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+                                    let db = state.db.get().expect("db pool");
                                     db.query_row("SELECT 1 FROM channels WHERE id = ?1",
                                         rusqlite::params![channel_id], |_| Ok(true))
                                         .unwrap_or(false)
@@ -225,7 +228,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
                         // Insert message and link attachments in a transaction
                         let (msg_id, attachments) = {
-                            let mut db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut db = state.db.get().expect("db pool");
                             let tx = db.transaction().unwrap();
 
                             // Insert the message
@@ -331,7 +334,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             .as_secs() as i64;
 
                         let (updated, channel_id) = {
-                            let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+                            let db = state.db.get().expect("db pool");
                             // Fetch channel_id and old content to save history
                             let row: Option<(String, String)> = db.query_row(
                                 "SELECT channel_id, content FROM messages WHERE id = ?1 AND beam_identity = ?2",
@@ -378,7 +381,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         };
 
                         let channel_id: Option<String> = {
-                            let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+                            let db = state.db.get().expect("db pool");
                             let ch: Option<String> = db.query_row(
                                 "SELECT channel_id FROM messages WHERE id = ?1 AND beam_identity = ?2",
                                 rusqlite::params![message_id, id],

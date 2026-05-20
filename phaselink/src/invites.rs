@@ -55,7 +55,7 @@ pub async fn list_invites(
             .into_response();
     }
 
-    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+    let db = state.db.get().expect("db pool");
     let mut stmt = match db.prepare(
         "SELECT code, created_by, created_at, expires_at, max_uses, use_count
          FROM invites ORDER BY created_at DESC",
@@ -169,7 +169,7 @@ pub async fn create_invite(
     // Generate a unique code (retry on collision — vanishingly rare)
     let code = loop {
         let candidate = generate_invite_code();
-        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let db = state.db.get().expect("db pool");
         let exists: bool = db
             .query_row(
                 "SELECT 1 FROM invites WHERE code = ?1",
@@ -183,7 +183,7 @@ pub async fn create_invite(
     };
 
     {
-        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let db = state.db.get().expect("db pool");
         if let Err(e) = db.execute(
             "INSERT INTO invites (code, created_by, expires_at, max_uses)
              VALUES (?1, ?2, ?3, ?4)",
@@ -220,7 +220,7 @@ pub async fn get_invite(
     Path(code): Path<String>,
 ) -> impl IntoResponse {
     let row = {
-        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let db = state.db.get().expect("db pool");
         db.query_row(
             "SELECT code, created_by, expires_at, max_uses, use_count
              FROM invites WHERE code = ?1",
@@ -333,7 +333,7 @@ pub async fn redeem_invite(
             .into_response();
     }
 
-    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+    let db = state.db.get().expect("db pool");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -449,7 +449,7 @@ pub async fn delete_invite(
     let owner = state.settings.read().await.owner_beam_identity.clone();
     let is_owner = !owner.is_empty() && identity == owner;
 
-    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+    let db = state.db.get().expect("db pool");
     let created_by: Option<String> = db
         .query_row(
             "SELECT created_by FROM invites WHERE code = ?1",
@@ -719,7 +719,7 @@ pub async fn join_redeem(
     // MutexGuard<Connection> is !Send; keeping it across an await makes the future
     // non-Send and breaks the axum Handler<_, _> trait bound.
     let rows_affected = {
-        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let db = state.db.get().expect("db pool");
         db.execute(
             "UPDATE invites SET use_count = use_count + 1 \
              WHERE code = ?1 AND (expires_at IS NULL OR expires_at > ?2) \
@@ -734,7 +734,7 @@ pub async fn join_redeem(
             // Register new member in users table so they appear immediately in the member list.
             // Second lock is in its own block, also dropped before the await below.
             {
-                let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+                let db = state.db.get().expect("db pool");
                 let _ = db.execute(
                     "INSERT INTO users (beam_identity, status) VALUES (?1, 'offline') \
                      ON CONFLICT(beam_identity) DO UPDATE SET is_deleted = 0, status = 'offline'",
@@ -746,7 +746,7 @@ pub async fn join_redeem(
         }
         Ok(0) => {
             // Acquire a fresh lock for diagnostic queries — no await in this arm.
-            let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+            let db = state.db.get().expect("db pool");
             let exists: bool = db
                 .query_row(
                     "SELECT 1 FROM invites WHERE code = ?1",
