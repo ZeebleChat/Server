@@ -46,6 +46,7 @@ mod openapi;
 mod permissions;
 mod pubsub;
 mod rate_limit;
+mod read_state;
 mod roles;
 mod server_settings;
 mod ws;
@@ -82,6 +83,9 @@ pub fn create_router(state: Arc<AppState>) -> Router<()> {
             "/v1/channels",
             get(channels::list_channels).post(channels::create_channel),
         )
+        .route("/v1/channels/unread", get(read_state::get_unread_channels))
+        .route("/v1/channels/:channel_id/read", post(read_state::mark_channel_read))
+        .route("/v1/channels/:channel_id/mention", post(read_state::increment_mention))
         .route(
             "/v1/channels/:id",
             delete(channels::delete_channel).patch(channels::rename_channel),
@@ -638,6 +642,20 @@ CREATE TABLE IF NOT EXISTS users (
             edited_at   INTEGER NOT NULL DEFAULT (unixepoch())
         );
         CREATE INDEX IF NOT EXISTS idx_edit_history_msg ON message_edit_history(message_id);
+
+        CREATE TABLE IF NOT EXISTS channel_reads (
+            beam_identity TEXT NOT NULL,
+            channel_id    TEXT NOT NULL,
+            last_read_at  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (beam_identity, channel_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS channel_mentions (
+            beam_identity TEXT NOT NULL,
+            channel_id    TEXT NOT NULL,
+            count         INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (beam_identity, channel_id)
+        );
 
         INSERT OR IGNORE INTO channels (id, name, topic)
         VALUES ('general', 'general', 'General zeeble-chat for everyone');

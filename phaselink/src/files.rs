@@ -21,12 +21,11 @@ pub struct UploadResult {
 }
 
 const ALLOWED_MIME_TYPES: &[&str] = &[
-    // Images
+    // Images (SVG excluded — can embed JavaScript, stored XSS risk)
     "image/jpeg",
     "image/png",
     "image/gif",
     "image/webp",
-    "image/svg+xml",
     // Videos
     "video/mp4",
     "video/webm",
@@ -42,6 +41,29 @@ const ALLOWED_MIME_TYPES: &[&str] = &[
     "application/zip",
     "application/x-zip-compressed",
 ];
+
+/// Verify that `data`'s actual content matches the client-declared MIME type.
+/// Text types are checked for valid UTF-8; binary types are checked via magic bytes.
+fn verify_mime_type(declared: &str, data: &[u8]) -> bool {
+    match declared {
+        // No magic bytes for plain text — require valid UTF-8 and no null bytes
+        // (null bytes indicate binary content masquerading as text)
+        "text/plain" | "text/markdown" => {
+            std::str::from_utf8(data).is_ok() && !data.contains(&0u8)
+        }
+        _ => {
+            // application/x-zip-compressed is an alias; infer returns application/zip
+            let expected = if declared == "application/x-zip-compressed" {
+                "application/zip"
+            } else {
+                declared
+            };
+            infer::get(data)
+                .map(|kind| kind.mime_type() == expected)
+                .unwrap_or(false)
+        }
+    }
+}
 
 fn sanitize_filename(filename: &str) -> String {
     let sanitized = filename.replace("..", "").replace(['/', '\\'], "_");
@@ -123,6 +145,10 @@ pub async fn upload_file(
                     .into_response();
             }
             bytes.extend_from_slice(&chunk);
+        }
+
+        if !verify_mime_type(&mime_type, &bytes) {
+            continue;
         }
 
         attachments_data.push((filename, mime_type, bytes));
@@ -239,7 +265,6 @@ pub async fn get_attachment(
     Extension(state): Extension<Arc<AppState>>,
     Path(attachment_id): Path<i64>,
     headers: HeaderMap,
-    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let auth_result = if let Some(auth_header) = headers.get("Authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
@@ -251,8 +276,6 @@ pub async fn get_attachment(
         } else {
             None
         }
-    } else if let Some(token) = params.get("token") {
-        validate_jwt(token, &*state).await
     } else {
         None
     };
@@ -342,12 +365,24 @@ pub async fn get_attachment(
         }
     };
 
+    // Force attachment disposition for types that can execute or render as documents.
+    // Only true raster/video/audio types are served inline.
+    let inline_types = ["image/jpeg", "image/png", "image/gif", "image/webp",
+                        "video/mp4", "video/webm",
+                        "audio/mpeg", "audio/ogg", "audio/wav"];
+    let disposition = if inline_types.contains(&mime_type.as_str()) {
+        format!("inline; filename=\"{}\"", filename)
+    } else {
+        format!("attachment; filename=\"{}\"", filename)
+    };
+
     debug!("attachment {attachment_id} served: {filename} ({file_size} bytes)");
     (
         [
             (axum::http::header::CONTENT_TYPE, mime_type),
-            (axum::http::header::CONTENT_DISPOSITION, format!("inline; filename=\"{}\"", filename)),
+            (axum::http::header::CONTENT_DISPOSITION, disposition),
             (axum::http::header::CONTENT_LENGTH, file_size.to_string()),
+            (axum::http::header::HeaderName::from_static("x-content-type-options"), "nosniff".to_string()),
         ],
         data,
     )
@@ -411,8 +446,52 @@ mod tests {
     }
 
     #[test]
+    fn verify_mime_rejects_html_declared_as_png() {
+        let html = b"<html><script>alert(1)</script></html>";
+        assert!(!verify_mime_type("image/png", html));
+    }
+
+    #[test]
+    fn verify_mime_accepts_valid_png() {
+        // Minimal PNG magic bytes: \x89PNG\r\n\x1a\n
+        let png_magic = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        assert!(verify_mime_type("image/png", png_magic));
+    }
+
+    #[test]
+    fn verify_mime_accepts_valid_utf8_text() {
+        assert!(verify_mime_type("text/plain", b"hello world"));
+        assert!(verify_mime_type("text/markdown", b"# Heading\n\nParagraph."));
+    }
+
+    #[test]
+    fn verify_mime_rejects_binary_declared_as_text() {
+        // Null byte signals binary content
+        assert!(!verify_mime_type("text/plain", b"hello\x00world"));
+        // Invalid UTF-8
+        assert!(!verify_mime_type("text/plain", &[0xFF, 0xFE, 0x00]));
+    }
+
+    #[test]
+    fn verify_mime_rejects_exe_declared_as_jpeg() {
+        // PE/DOS executable magic: MZ
+        let exe = b"MZ\x90\x00\x03\x00\x00\x00";
+        assert!(!verify_mime_type("image/jpeg", exe));
+    }
+
+    #[test]
+    fn verify_mime_handles_zip_alias() {
+        // application/x-zip-compressed should accept real ZIP magic bytes
+        let zip_magic = b"PK\x03\x04\x14\x00\x00\x00";
+        assert!(verify_mime_type("application/x-zip-compressed", zip_magic));
+        assert!(verify_mime_type("application/zip", zip_magic));
+    }
+
+    #[test]
     fn disallowed_mime_types_not_in_list() {
         assert!(!ALLOWED_MIME_TYPES.contains(&"application/x-executable"));
         assert!(!ALLOWED_MIME_TYPES.contains(&"application/javascript"));
+        // SVG is blocked because it can embed JavaScript (stored XSS)
+        assert!(!ALLOWED_MIME_TYPES.contains(&"image/svg+xml"));
     }
 }

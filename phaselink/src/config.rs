@@ -260,7 +260,7 @@ impl Settings {
             .ok()
             .map(|s| parse_list(&s))
             .or_else(|| file.age_proof_methods.clone())
-            .unwrap_or_else(|| vec!["email".into(), "id".into(), "phone".into()]);
+            .unwrap_or_default();
 
         let allow_bots = std::env::var("ALLOW_BOTS")
             .ok()
@@ -350,10 +350,17 @@ impl Config {
             .unwrap_or_else(|_| "/data/phaselink.yaml".to_string());
         let (file, config_path) = match std::fs::read_to_string(&yaml_path) {
             Ok(contents) => {
-                let parsed: ConfigFile = serde_yaml::from_str(&contents).unwrap_or_default();
+                let parsed: ConfigFile = serde_yml::from_str(&contents).unwrap_or_default();
                 (parsed, Some(yaml_path))
             }
-            Err(_) => (ConfigFile::default(), None),
+            Err(_) => {
+                // File doesn't exist yet — create it so PATCH /v1/server/settings can persist.
+                if let Some(parent) = std::path::Path::new(&yaml_path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&yaml_path, "");
+                (ConfigFile::default(), Some(yaml_path))
+            }
         };
 
         let port: u16 = std::env::var("PORT")

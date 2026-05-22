@@ -5,6 +5,7 @@ use axum::{
         Extension,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use redis::AsyncCommands;
@@ -117,10 +118,26 @@ async fn redis_publish(redis: &mut redis::aio::ConnectionManager, channel: &str,
 
 // ── WebSocket handler ─────────────────────────────────────────────────────────
 
+fn is_origin_allowed(headers: &HeaderMap, allowed_origins: &[String]) -> bool {
+    let origin = match headers.get("origin").and_then(|v| v.to_str().ok()) {
+        Some(o) => o,
+        None => return true,
+    };
+    if origin == "null" {
+        return false;
+    }
+    let origin = origin.trim_end_matches('/');
+    allowed_origins.iter().any(|a| a.trim_end_matches('/') == origin)
+}
+
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     Extension(state): Extension<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    if !is_origin_allowed(&headers, &state.allowed_origins) {
+        return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
+    }
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 

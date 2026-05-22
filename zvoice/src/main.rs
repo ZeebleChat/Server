@@ -33,6 +33,8 @@ pub struct AppState {
     pub auth_server_url: String,
     pub server_bus: broadcast::Sender<String>,
     pub redis: redis::aio::ConnectionManager,
+    /// Allowlist for WebSocket Origin checks. Empty = deny all browser origins.
+    pub allowed_origins: Vec<String>,
 }
 
 impl AppState {
@@ -287,6 +289,7 @@ fn main() {
             auth_server_url: auth_server_url.clone(),
             server_bus,
             redis: redis_conn,
+            allowed_origins: allowed_origins.clone(),
         });
 
         // ── Fetch JWKS ────────────────────────────────────────────────────────

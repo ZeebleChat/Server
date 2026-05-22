@@ -330,7 +330,7 @@ pub async fn patch_settings(
     if let Some(ref path) = state.config_path {
         let config_file = settings_to_config_file(&settings_guard);
         drop(settings_guard); // release write lock before file I/O
-        match serde_yaml::to_string(&config_file) {
+        match serde_yml::to_string(&config_file) {
             Ok(yaml) => {
                 if let Err(e) = std::fs::write(path, &yaml) {
                     warn!("failed to write phaselink.yaml: {e}");

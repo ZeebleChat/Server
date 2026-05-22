@@ -41,6 +41,9 @@ pub struct WsBroadcast {
     pub created_at: i64,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub attachments: Vec<Attachment>,
+    /// beam_identities that were @mentioned in this message.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub mentions: Vec<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]

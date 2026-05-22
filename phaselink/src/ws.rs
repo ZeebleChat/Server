@@ -76,6 +76,31 @@ pub enum WsIncoming {
     },
 }
 
+/// Returns true if the WebSocket upgrade should be allowed.
+/// Browsers always send an Origin header; native/CLI clients typically don't.
+/// Rules:
+///   - No Origin header  → allow (native client)
+///   - Origin == "null"  → deny  (sandboxed iframe)
+///   - Origin in allowlist (settings.allowed_origins, falling back to public_url) → allow
+///   - Anything else     → deny
+async fn is_origin_allowed(headers: &HeaderMap, state: &AppState) -> bool {
+    let origin = match headers.get("origin").and_then(|v| v.to_str().ok()) {
+        Some(o) => o,
+        None => return true,
+    };
+    if origin == "null" {
+        return false;
+    }
+    let settings = state.settings.read().await;
+    let effective: Vec<&str> = if settings.allowed_origins.is_empty() {
+        vec![settings.public_url.as_str()]
+    } else {
+        settings.allowed_origins.iter().map(String::as_str).collect()
+    };
+    let origin = origin.trim_end_matches('/');
+    effective.iter().any(|a| a.trim_end_matches('/') == origin)
+}
+
 async fn send_err(socket: &mut WebSocket, msg: &str) {
     let _ = socket
         .send(Message::Text(
@@ -87,7 +112,11 @@ async fn send_err(socket: &mut WebSocket, msg: &str) {
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     Extension(state): Extension<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    if !is_origin_allowed(&headers, &state).await {
+        return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
+    }
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
@@ -287,6 +316,48 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             (msg_id, att_vec)
                         };
 
+                        // ── Server-side @mention detection ───────────────────
+                        // Query all non-deleted users, extract display name
+                        // (everything before '»'), check if content contains
+                        // @displayname (case-insensitive). Persist to
+                        // channel_mentions and include in the broadcast so
+                        // every connected client can update its badge without
+                        // doing any string-matching itself.
+                        let mentioned_identities: Vec<String> = {
+                            let db = state.db.get().expect("db pool");
+                            let identities: Vec<String> = {
+                                let mut stmt = db.prepare(
+                                    "SELECT DISTINCT beam_identity FROM users WHERE is_deleted = 0"
+                                ).unwrap_or_else(|_| db.prepare("SELECT beam_identity FROM users LIMIT 0").unwrap());
+                                stmt.query_map([], |row| row.get::<_, String>(0))
+                                    .unwrap()
+                                    .filter_map(|r| r.ok())
+                                    .collect()
+                            };
+                            let content_lower = content.to_lowercase();
+                            let mut mentioned = Vec::new();
+                            for identity in identities {
+                                if identity == id { continue; } // skip sender
+                                let display_name = identity
+                                    .split('\u{00BB}') // '»'
+                                    .next()
+                                    .unwrap_or("")
+                                    .to_lowercase();
+                                if display_name.is_empty() { continue; }
+                                if content_lower.contains(&format!("@{display_name}")) {
+                                    let _ = db.execute(
+                                        "INSERT INTO channel_mentions (beam_identity, channel_id, count)
+                                         VALUES (?1, ?2, 1)
+                                         ON CONFLICT(beam_identity, channel_id)
+                                         DO UPDATE SET count = count + 1",
+                                        rusqlite::params![identity, channel_id],
+                                    );
+                                    mentioned.push(identity);
+                                }
+                            }
+                            mentioned
+                        };
+
                         let att_count = attachments.len();
                         let broadcast = serde_json::to_string(&WsBroadcast {
                             kind: "message",
@@ -298,13 +369,17 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             reply_to: reply_to_int,
                             created_at,
                             attachments,
+                            mentions: mentioned_identities,
                         }).unwrap();
                         info!(
                             "ws: message {msg_id} sent by {id} in #{channel_id} ({} chars{})"
                             , content.len()
                             , if att_count > 0 { format!(", {att_count} attachment(s)") } else { String::new() }
                         );
-                        let _ = state.bus_for(&channel_id).send(broadcast);
+                        // Send to per-channel bus (clients viewing this channel) AND
+                        // server_bus (all authenticated clients, for cross-channel updates).
+                        let _ = state.bus_for(&channel_id).send(broadcast.clone());
+                        let _ = state.server_bus.send(broadcast);
                     }
 
                     WsIncoming::Leave { channel_id } => {
@@ -370,7 +445,8 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             "content":      content,
                             "edited_at":    edited_at,
                         })).unwrap();
-                        let _ = state.bus_for(&channel_id).send(broadcast);
+                        let _ = state.bus_for(&channel_id).send(broadcast.clone());
+                        let _ = state.server_bus.send(broadcast);
                     }
 
                     // Delete a message — only the original sender may delete
@@ -408,7 +484,8 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                     "id":         message_id,
                                     "channel_id": ch.clone(),
                                 })).unwrap();
-                                let _ = state.bus_for(&ch).send(broadcast);
+                                let _ = state.bus_for(&ch).send(broadcast.clone());
+                                let _ = state.server_bus.send(broadcast);
                             }
                         }
                     }
