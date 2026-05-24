@@ -358,6 +358,35 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             mentioned
                         };
 
+                        // ── Reply notification ────────────────────────────────
+                        // If this is a reply, treat the original message's
+                        // author as mentioned so they get a ping even without
+                        // an explicit @name in the text.
+                        let mentioned_identities = {
+                            let mut mentioned = mentioned_identities;
+                            if let Some(parent_id) = reply_to_int {
+                                let db = state.db.get().expect("db pool");
+                                let parent_author: Option<String> = db.query_row(
+                                    "SELECT beam_identity FROM messages WHERE id = ?1",
+                                    rusqlite::params![parent_id],
+                                    |row| row.get(0),
+                                ).ok();
+                                if let Some(author) = parent_author {
+                                    if author != id && !mentioned.contains(&author) {
+                                        let _ = db.execute(
+                                            "INSERT INTO channel_mentions (beam_identity, channel_id, count)
+                                             VALUES (?1, ?2, 1)
+                                             ON CONFLICT(beam_identity, channel_id)
+                                             DO UPDATE SET count = count + 1",
+                                            rusqlite::params![author, channel_id],
+                                        );
+                                        mentioned.push(author);
+                                    }
+                                }
+                            }
+                            mentioned
+                        };
+
                         let att_count = attachments.len();
                         let broadcast = serde_json::to_string(&WsBroadcast {
                             kind: "message",
