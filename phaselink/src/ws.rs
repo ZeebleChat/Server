@@ -13,14 +13,11 @@ pub enum WsIncoming {
     },
     Activate {
         server_id: String,
-        token: String,
     },
     Join {
-        token: String,
         channel_id: String,
     },
     Message {
-        token: String,
         channel_id: String,
         content: String,
         #[serde(default)]
@@ -34,12 +31,10 @@ pub enum WsIncoming {
         channel_id: String,
     },
     EditMessage {
-        token: String,
         message_id: i64,
         content: String,
     },
     DeleteMessage {
-        token: String,
         message_id: i64,
     },
     Read,
@@ -175,69 +170,58 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             }
                         }
                     }
-                    WsIncoming::Activate { server_id, token } => {
-                        match resolve_identity(&token, &state).await {
-                            None => {
-                                send_err(&mut socket, "Invalid or expired token").await;
-                                break;
-                            }
-                            Some(_id) => {
-                                // Subscribe to server-wide broadcasts
-                                server_rx = Some(state.server_bus.subscribe());
-
-                                let _ = socket
-                                    .send(Message::Text(
-                                        json!({ "type": "activated", "server_id": server_id }).to_string()
-                                    ))
-                                    .await;
-
-                                // Send current voice presence snapshot so the client
-                                // can show who's in each voice channel without polling.
-                                let rooms: HashMap<String, Vec<String>> = {
-                                    let members = state.voice_members.lock().unwrap();
-                                    members.iter()
-                                        .filter(|(_, v)| !v.is_empty())
-                                        .map(|(ch, ids)| (ch.clone(), ids.iter().cloned().collect()))
-                                        .collect()
-                                };
-                                if !rooms.is_empty() {
-                                    let _ = socket.send(Message::Text(
-                                        json!({ "type": "voice_snapshot", "rooms": rooms }).to_string()
-                                    )).await;
-                                }
-                            }
+                    WsIncoming::Activate { server_id } => {
+                        if identity.is_none() {
+                            send_err(&mut socket, "Not authenticated").await;
+                            break;
                         }
-                    }
+                        // Subscribe to server-wide broadcasts
+                        server_rx = Some(state.server_bus.subscribe());
 
-                    WsIncoming::Join { token, channel_id } => {
-                        match resolve_identity(&token, &state).await {
-                            None => { send_err(&mut socket, "Invalid or expired token").await; break; }
-                            Some(id) => {
-                                let was_unauth = identity.is_none();
-                                identity = Some(id.clone());
-                                if was_unauth {
-                                    state.mark_online(&id);
-                                }
-                                let exists = {
-                                    let db = state.db.get().expect("db pool");
-                                    db.query_row("SELECT 1 FROM channels WHERE id = ?1",
-                                        rusqlite::params![channel_id], |_| Ok(true))
-                                        .unwrap_or(false)
-                                };
-                                if !exists { send_err(&mut socket, "Channel not found").await; continue; }
-                                current_channel = Some(channel_id.clone());
-                                rx = Some(state.bus_for(&channel_id).subscribe());
-                                info!("{} joined #{}", identity.as_deref().unwrap_or("?"), channel_id);
-                            }
-                        }
-                    }
+                        let _ = socket
+                            .send(Message::Text(
+                                json!({ "type": "activated", "server_id": server_id }).to_string()
+                            ))
+                            .await;
 
-                    WsIncoming::Message { token, channel_id, content, attachment_ids, title, reply_to } => {
-                        let id = match resolve_identity(&token, &state).await {
-                            Some(id) => id,
-                            None => { send_err(&mut socket, "Token expired").await; break; }
+                        // Send current voice presence snapshot so the client
+                        // can show who's in each voice channel without polling.
+                        let rooms: HashMap<String, Vec<String>> = {
+                            let members = state.voice_members.lock().unwrap();
+                            members.iter()
+                                .filter(|(_, v)| !v.is_empty())
+                                .map(|(ch, ids)| (ch.clone(), ids.iter().cloned().collect()))
+                                .collect()
                         };
-                        identity = Some(id.clone());
+                        if !rooms.is_empty() {
+                            let _ = socket.send(Message::Text(
+                                json!({ "type": "voice_snapshot", "rooms": rooms }).to_string()
+                            )).await;
+                        }
+                    }
+
+                    WsIncoming::Join { channel_id } => {
+                        let id = match &identity {
+                            Some(id) => id.clone(),
+                            None => { send_err(&mut socket, "Not authenticated").await; break; }
+                        };
+                        let exists = {
+                            let db = state.db.get().expect("db pool");
+                            db.query_row("SELECT 1 FROM channels WHERE id = ?1",
+                                rusqlite::params![channel_id], |_| Ok(true))
+                                .unwrap_or(false)
+                        };
+                        if !exists { send_err(&mut socket, "Channel not found").await; continue; }
+                        current_channel = Some(channel_id.clone());
+                        rx = Some(state.bus_for(&channel_id).subscribe());
+                        info!("{id} joined #{channel_id}");
+                    }
+
+                    WsIncoming::Message { channel_id, content, attachment_ids, title, reply_to } => {
+                        let id = match &identity {
+                            Some(id) => id.clone(),
+                            None => { send_err(&mut socket, "Not authenticated").await; break; }
+                        };
 
                         let content = content.trim().to_string();
                         if content.is_empty() && attachment_ids.is_empty() { continue; }
@@ -419,10 +403,10 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     }
 
                     // Edit a message — only the original sender may edit
-                    WsIncoming::EditMessage { token, message_id, content } => {
-                        let id = match resolve_identity(&token, &state).await {
-                            Some(id) => id,
-                            None => { send_err(&mut socket, "Token expired").await; break; }
+                    WsIncoming::EditMessage { message_id, content } => {
+                        let id = match &identity {
+                            Some(id) => id.clone(),
+                            None => { send_err(&mut socket, "Not authenticated").await; break; }
                         };
 
                         let content = content.trim().to_string();
@@ -479,10 +463,10 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     }
 
                     // Delete a message — only the original sender may delete
-                    WsIncoming::DeleteMessage { token, message_id } => {
-                        let id = match resolve_identity(&token, &state).await {
-                            Some(id) => id,
-                            None => { send_err(&mut socket, "Token expired").await; break; }
+                    WsIncoming::DeleteMessage { message_id } => {
+                        let id = match &identity {
+                            Some(id) => id.clone(),
+                            None => { send_err(&mut socket, "Not authenticated").await; break; }
                         };
 
                         let channel_id: Option<String> = {

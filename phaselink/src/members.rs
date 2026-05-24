@@ -230,7 +230,12 @@ pub async fn update_status(
             // Broadcast member_update to connected clients
             if let Ok(guard) = state.settings.try_read() {
                 let server_name = guard.server_name.clone();
-                let payload = format!(r#"{{"type":"member_update","beam_identity":"{}","status":"{}","server_id":"{}"}}"#, identity, body.status, server_name);
+                let payload = json!({
+                    "type": "member_update",
+                    "beam_identity": identity,
+                    "status": body.status,
+                    "server_id": server_name,
+                }).to_string();
                 let _ = state.server_bus.send(payload);
             }
             Json(json!({ "status": body.status })).into_response()
