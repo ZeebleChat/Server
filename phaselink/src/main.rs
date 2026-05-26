@@ -224,11 +224,7 @@ async fn security_headers(
 
 async fn server_info(
     axum::extract::Extension(state): axum::extract::Extension<Arc<AppState>>,
-    headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers).await {
-        return e.into_response();
-    }
     let s = state.settings.read().await;
 
     let channels: Vec<Value> = {

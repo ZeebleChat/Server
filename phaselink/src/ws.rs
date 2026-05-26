@@ -151,7 +151,10 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         match crate::auth::resolve_identity_with_avatar(&token, &state).await {
                             None => {
                                 warn!("ws: auth failed (invalid/expired token)");
-                                send_err(&mut socket, "Invalid or expired token").await;
+                                let _ = socket.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                                    code: 4401,
+                                    reason: std::borrow::Cow::Borrowed("token_expired"),
+                                }))).await;
                                 break;
                             }
                             Some((id, avatar)) => {
