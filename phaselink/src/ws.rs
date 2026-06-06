@@ -26,6 +26,10 @@ pub enum WsIncoming {
         title: Option<String>,
         #[serde(default)]
         reply_to: Option<String>,
+        /// Client-supplied correlation token — echoed back in the `message_ack`
+        /// so the client can swap its optimistic temp-ID for the real server ID.
+        #[serde(default)]
+        nonce: Option<String>,
     },
     Leave {
         channel_id: String,
@@ -220,7 +224,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         info!("{id} joined #{channel_id}");
                     }
 
-                    WsIncoming::Message { channel_id, content, attachment_ids, title, reply_to } => {
+                    WsIncoming::Message { channel_id, content, attachment_ids, title, reply_to, nonce } => {
                         let id = match &identity {
                             Some(id) => id.clone(),
                             None => { send_err(&mut socket, "Not authenticated").await; break; }
@@ -374,15 +378,26 @@ pub async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             mentioned
                         };
 
+                        // ── Direct ack to sender ─────────────────────────────
+                        // Send the real server-assigned ID (and the nonce if the
+                        // client supplied one) so it can replace its optimistic ID.
+                        let ack = json!({
+                            "type":       "message_ack",
+                            "id":         crate::messages::fmt_msg_id(msg_id),
+                            "channel_id": channel_id,
+                            "nonce":      nonce,
+                        });
+                        let _ = socket.send(Message::Text(ack.to_string())).await;
+
                         let att_count = attachments.len();
                         let broadcast = serde_json::to_string(&WsBroadcast {
                             kind: "message",
-                            id: msg_id,
+                            id: crate::messages::fmt_msg_id(msg_id),
                             channel_id: channel_id.clone(),
                             beam_identity: id.clone(),
                             content: content.clone(),
                             title: title.clone(),
-                            reply_to: reply_to_int,
+                            reply_to: reply_to_int.map(crate::messages::fmt_msg_id),
                             created_at,
                             attachments,
                             mentions: mentioned_identities,

@@ -285,10 +285,10 @@ pub async fn bot_send_message(
         db.last_insert_rowid()
     };
 
-    // Broadcast to channel bus so WebSocket clients see the message in real time
+    let fmt_id = crate::messages::fmt_msg_id(msg_id);
     let broadcast = serde_json::to_string(&json!({
         "type":          "message",
-        "id":            msg_id,
+        "id":            fmt_id,
         "channel_id":    channel_id,
         "beam_identity": beam_identity,
         "content":       content,
@@ -297,9 +297,221 @@ pub async fn bot_send_message(
     }))
     .unwrap();
     let _ = state.bus_for(&channel_id).send(broadcast);
-
     tracing::info!("bot:{bot_name} sent message {msg_id} in #{channel_id}");
-    Json(json!({ "id": msg_id, "ok": true })).into_response()
+    Json(json!({ "id": fmt_id, "ok": true })).into_response()
+}
+
+/// GET /bot/server/info — get server info (bot token auth).
+pub async fn bot_server_info(
+    Extension(state): Extension<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_bot_auth(&state, &headers).await {
+        return e.into_response();
+    }
+
+    let s = state.settings.read().await;
+    let channels: Vec<Value> = {
+        let db = state.db.get().expect("db pool");
+        let mut stmt = db.prepare("SELECT id, name, topic, type FROM channels").unwrap();
+        stmt.query_map([], |row| {
+            Ok(json!({
+                "id":    row.get::<_, String>(0)?,
+                "name":  row.get::<_, String>(1)?,
+                "topic": row.get::<_, String>(2)?,
+                "type":  row.get::<_, String>(3)?,
+            }))
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    };
+
+    Json(json!({
+        "server_name": s.server_name,
+        "about":       s.about,
+        "channels":    channels,
+    }))
+    .into_response()
+}
+
+/// GET /bot/channels — list all channels (bot token auth).
+pub async fn bot_list_channels(
+    Extension(state): Extension<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_bot_auth(&state, &headers).await {
+        return e.into_response();
+    }
+
+    let channels: Vec<Value> = {
+        let db = state.db.get().expect("db pool");
+        let mut stmt = db
+            .prepare("SELECT id, name, topic, type FROM channels ORDER BY position ASC")
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok(json!({
+                "id":    row.get::<_, String>(0)?,
+                "name":  row.get::<_, String>(1)?,
+                "topic": row.get::<_, String>(2)?,
+                "type":  row.get::<_, String>(3)?,
+            }))
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    };
+
+    Json(json!({ "channels": channels })).into_response()
+}
+
+/// GET /bot/members — list members (bot token auth).
+pub async fn bot_list_members(
+    Extension(state): Extension<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_bot_auth(&state, &headers).await {
+        return e.into_response();
+    }
+
+    let members: Vec<Value> = {
+        let db = state.db.get().expect("db pool");
+        let mut stmt = db
+            .prepare(
+                "SELECT beam_identity, status, role, avatar_attachment_id \
+                 FROM users WHERE is_deleted = 0 ORDER BY beam_identity ASC",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok(json!({
+                "beam_identity": row.get::<_, String>(0)?,
+                "status":        row.get::<_, String>(1)?,
+                "role":          row.get::<_, Option<String>>(2)?,
+                "avatar":        row.get::<_, Option<String>>(3)?,
+            }))
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    };
+
+    Json(json!({ "members": members })).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct BotEditMessagePayload {
+    content: String,
+}
+
+/// PATCH /bot/messages/:message_id — edit a message sent by this bot.
+pub async fn bot_edit_message(
+    Extension(state): Extension<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(raw_id): Path<String>,
+    Json(payload): Json<BotEditMessagePayload>,
+) -> impl IntoResponse {
+    let (bot_id, _bot_name) = match require_bot_auth(&state, &headers).await {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    let message_id = match crate::messages::parse_msg_id(&raw_id) {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid message id" }))).into_response(),
+    };
+
+    let content = payload.content.trim().to_string();
+    if content.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "content is required" }))).into_response();
+    }
+    let max_len = state.settings.read().await.max_message_length as usize;
+    if content.len() > max_len {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("message too long (max {max_len} chars)") }))).into_response();
+    }
+
+    let edited_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let db = state.db.get().expect("db pool");
+
+    let channel_id: Option<String> = db.query_row(
+        "SELECT channel_id FROM messages WHERE id = ?1 AND bot_id = ?2",
+        rusqlite::params![message_id, bot_id],
+        |row| row.get(0),
+    ).ok();
+
+    let Some(channel_id) = channel_id else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "message not found or not owned by this bot" }))).into_response();
+    };
+
+    match db.execute(
+        "UPDATE messages SET content = ?1, edited_at = ?2 WHERE id = ?3 AND bot_id = ?4",
+        rusqlite::params![content, edited_at, message_id, bot_id],
+    ) {
+        Ok(_) => {
+            let fmt_id = crate::messages::fmt_msg_id(message_id);
+            let broadcast = serde_json::to_string(&json!({
+                "type":       "message_edited",
+                "id":         fmt_id,
+                "channel_id": channel_id,
+                "content":    content,
+                "edited_at":  edited_at,
+            }))
+            .unwrap();
+            let _ = state.bus_for(&channel_id).send(broadcast);
+            tracing::info!("bot:{bot_id} edited message {message_id} in #{channel_id}");
+            Json(json!({ "ok": true, "edited_at": edited_at })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("{e}") }))).into_response(),
+    }
+}
+
+/// DELETE /bot/messages/:message_id — delete a message sent by this bot.
+pub async fn bot_delete_message(
+    Extension(state): Extension<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(raw_id): Path<String>,
+) -> impl IntoResponse {
+    let (bot_id, _bot_name) = match require_bot_auth(&state, &headers).await {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    let message_id = match crate::messages::parse_msg_id(&raw_id) {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid message id" }))).into_response(),
+    };
+
+    let db = state.db.get().expect("db pool");
+
+    let channel_id: Option<String> = db.query_row(
+        "SELECT channel_id FROM messages WHERE id = ?1 AND bot_id = ?2",
+        rusqlite::params![message_id, bot_id],
+        |row| row.get(0),
+    ).ok();
+
+    let Some(channel_id) = channel_id else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "message not found or not owned by this bot" }))).into_response();
+    };
+
+    match db.execute(
+        "DELETE FROM messages WHERE id = ?1 AND bot_id = ?2",
+        rusqlite::params![message_id, bot_id],
+    ) {
+        Ok(_) => {
+            let fmt_id = crate::messages::fmt_msg_id(message_id);
+            let broadcast = serde_json::to_string(&json!({
+                "type":       "message_deleted",
+                "id":         fmt_id,
+                "channel_id": channel_id,
+            }))
+            .unwrap();
+            let _ = state.bus_for(&channel_id).send(broadcast);
+            tracing::info!("bot:{bot_id} deleted message {message_id} in #{channel_id}");
+            Json(json!({ "ok": true })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("{e}") }))).into_response(),
+    }
 }
 
 /// GET /bot/channels/:channel_id/messages — read recent messages (bot token auth).

@@ -49,6 +49,7 @@ mod rate_limit;
 mod read_state;
 mod roles;
 mod server_settings;
+mod webhooks;
 mod ws;
 
 // Re-export auth helpers so sibling modules can use `crate::validate_jwt` etc.
@@ -152,10 +153,20 @@ pub fn create_router(state: Arc<AppState>) -> Router<()> {
         // Bot management (owner only)
         .route("/v1/bots", get(bots::list_bots).post(bots::create_bot))
         .route("/v1/bots/:id", delete(bots::delete_bot))
+        // Webhook management (owner only)
+        .route("/v1/webhooks", get(webhooks::list_webhooks).post(webhooks::create_webhook))
+        .route("/v1/webhooks/:id", delete(webhooks::delete_webhook))
         // Bot action endpoints (bot token auth)
+        .route("/v1/bot/server/info", get(bots::bot_server_info))
+        .route("/v1/bot/channels", get(bots::bot_list_channels))
+        .route("/v1/bot/members", get(bots::bot_list_members))
         .route(
             "/v1/bot/channels/:channel_id/messages",
             get(bots::bot_get_messages).post(bots::bot_send_message),
+        )
+        .route(
+            "/v1/bot/messages/:message_id",
+            patch(bots::bot_edit_message).delete(bots::bot_delete_message),
         )
         .route_layer(axum::middleware::from_fn(require_unlocked));
 
@@ -657,8 +668,22 @@ CREATE TABLE IF NOT EXISTS users (
             PRIMARY KEY (beam_identity, channel_id)
         );
 
+        CREATE TABLE IF NOT EXISTS webhooks (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            url         TEXT NOT NULL,
+            secret      TEXT NOT NULL,
+            channel_id  TEXT,
+            events      TEXT NOT NULL DEFAULT 'message',
+            created_by  TEXT NOT NULL,
+            created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
         INSERT OR IGNORE INTO channels (id, name, topic)
-        VALUES ('general', 'general', 'General zeeble-chat for everyone');
+        VALUES ('zblc1', 'general', 'General zeeble-chat for everyone');
+
+        -- Seed the channel sequence counter so new channels start at zblc2.
+        INSERT OR IGNORE INTO server_meta (key, value) VALUES ('channel_seq', '1');
     ",
     )
     .expect("DB setup failed");
@@ -681,6 +706,26 @@ CREATE TABLE IF NOT EXISTS users (
     run_migration(conn, "category_permissions", "allow", "ALTER TABLE category_permissions ADD COLUMN allow TEXT NOT NULL DEFAULT '{}'");
     run_migration(conn, "category_permissions", "deny",  "ALTER TABLE category_permissions ADD COLUMN deny  TEXT NOT NULL DEFAULT '{}'");
     run_migration(conn, "attachments", "file_path", "ALTER TABLE attachments ADD COLUMN file_path TEXT");
+
+    // Migrate the legacy "general" channel ID to the prefixed format.
+    // Updates all FK columns first, then renames the channel row.
+    let has_legacy: bool = conn.query_row(
+        "SELECT COUNT(*) FROM channels WHERE id = 'general'",
+        [],
+        |row| row.get(0),
+    ).unwrap_or(0i64) > 0;
+    if has_legacy {
+        conn.execute_batch("
+            BEGIN;
+            UPDATE messages            SET channel_id = 'zblc1' WHERE channel_id = 'general';
+            UPDATE channel_reads       SET channel_id = 'zblc1' WHERE channel_id = 'general';
+            UPDATE channel_mentions    SET channel_id = 'zblc1' WHERE channel_id = 'general';
+            UPDATE channel_permissions SET channel_id = 'zblc1' WHERE channel_id = 'general';
+            UPDATE channels            SET id         = 'zblc1' WHERE id = 'general';
+            INSERT OR IGNORE INTO server_meta (key, value) VALUES ('channel_seq', '1');
+            COMMIT;
+        ").ok();
+    }
 
     // Seed the @everyone role — this is the only role created automatically.
     // All other roles (Admin, Mod, etc.) can be created manually in server settings.
@@ -1330,31 +1375,20 @@ fn main() {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn create_startup_invite(conn: &mut Connection) -> String {
-    let code = generate_invite_code();
-    let tx = conn.transaction().unwrap();
-
-    let exists: bool = tx
-        .query_row(
-            "SELECT 1 FROM invites WHERE code = ?1",
-            rusqlite::params![code],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
-
-    if exists {
-        drop(tx);
-        return create_startup_invite(conn);
+    loop {
+        let code = generate_invite_code();
+        let rows = conn
+            .execute(
+                "INSERT OR IGNORE INTO invites (code, created_by, expires_at, max_uses, use_count)
+                 VALUES (?1, 'startup', NULL, NULL, 0)",
+                rusqlite::params![code],
+            )
+            .unwrap_or(0);
+        if rows > 0 {
+            info!("startup invite created: {}", code);
+            return code;
+        }
     }
-
-    tx.execute(
-        "INSERT INTO invites (code, created_by, expires_at, max_uses, use_count)
-         VALUES (?1, 'startup', NULL, NULL, 0)",
-        rusqlite::params![code],
-    )
-    .unwrap_or_default();
-    tx.commit().unwrap();
-    info!("startup invite created: {}", code);
-    code
 }
 
 fn get_local_ips() -> Vec<String> {

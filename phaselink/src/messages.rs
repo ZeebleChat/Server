@@ -2,16 +2,28 @@ use super::*;
 use axum::extract::Extension;
 use std::sync::Arc;
 
+pub fn fmt_msg_id(id: i64) -> String {
+    format!("zblm{id}")
+}
+
+/// Accept `zblmN` or a raw integer string.
+pub fn parse_msg_id(s: &str) -> Option<i64> {
+    s.strip_prefix("zblm")
+        .unwrap_or(s)
+        .parse()
+        .ok()
+}
+
 #[derive(Serialize, Deserialize, Clone, utoipa::ToSchema)]
 pub struct ChatMessage {
-    pub id: i64,
+    pub id: String,
     pub channel_id: String,
     pub beam_identity: String,
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reply_to: Option<i64>,
+    pub reply_to: Option<String>,
     pub created_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edited_at: Option<i64>,
@@ -31,13 +43,13 @@ pub struct Attachment {
 pub struct WsBroadcast {
     pub kind: &'static str,
     pub channel_id: String,
-    pub id: i64,
+    pub id: String,
     pub beam_identity: String,
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reply_to: Option<i64>,
+    pub reply_to: Option<String>,
     pub created_at: i64,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub attachments: Vec<Attachment>,
@@ -83,12 +95,12 @@ fn build_message_from_row(
     edited_at: Option<i64>,
 ) -> ChatMessage {
     ChatMessage {
-        id: msg_id,
+        id: fmt_msg_id(msg_id),
         channel_id,
         beam_identity,
         content,
         title,
-        reply_to,
+        reply_to: reply_to.map(fmt_msg_id),
         created_at,
         edited_at,
         attachments: Vec::new(),
@@ -322,10 +334,10 @@ pub async fn create_message(
     match insert_result {
         Ok(_) => {
             let message_id = db.last_insert_rowid();
-            // Broadcast new message
+            let fmt_id = fmt_msg_id(message_id);
             let broadcast = serde_json::to_string(&json!({
                 "type": "message",
-                "id": message_id,
+                "id": fmt_id,
                 "channel_id": channel_id,
                 "beam_identity": identity,
                 "content": content,
@@ -333,8 +345,15 @@ pub async fn create_message(
             }))
             .unwrap();
             let _ = state.bus_for(&channel_id).send(broadcast);
+            crate::webhooks::fire_event(Arc::clone(&state), "message", Some(channel_id.clone()), json!({
+                "id": fmt_id,
+                "channel_id": channel_id,
+                "beam_identity": identity,
+                "content": content,
+                "created_at": created_at,
+            }));
             info!("{identity} sent message {message_id} in #{channel_id}");
-            Json(json!({ "id": message_id, "created_at": created_at })).into_response()
+            Json(json!({ "id": fmt_id, "created_at": created_at })).into_response()
         }
         Err(e) => {
             error!("create message: {e}");
@@ -349,10 +368,14 @@ pub async fn create_message(
 
 pub async fn edit_message(
     Extension(state): Extension<Arc<AppState>>,
-    Path(message_id): Path<i64>,
+    Path(raw_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<EditMessageBody>,
 ) -> impl IntoResponse {
+    let message_id = match parse_msg_id(&raw_id) {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid message id" }))).into_response(),
+    };
     let identity = match require_auth(&state, &headers).await {
         Ok(id) => id,
         Err(e) => return e.into_response(),
@@ -411,16 +434,22 @@ pub async fn edit_message(
         rusqlite::params![content, edited_at, message_id, identity],
     ) {
         Ok(_) => {
-            // Broadcast edit to all channel subscribers
+            let fmt_id = fmt_msg_id(message_id);
             let broadcast = serde_json::to_string(&json!({
                 "type": "message_edited",
-                "id": message_id,
+                "id": fmt_id,
                 "channel_id": channel_id,
                 "content": content,
                 "edited_at": edited_at,
             }))
             .unwrap();
             let _ = state.bus_for(&channel_id).send(broadcast);
+            crate::webhooks::fire_event(Arc::clone(&state), "message_edited", Some(channel_id.clone()), json!({
+                "id": fmt_id,
+                "channel_id": channel_id,
+                "content": content,
+                "edited_at": edited_at,
+            }));
             info!("{identity} edited message {message_id} in #{channel_id}");
             Json(json!({ "ok": true, "edited_at": edited_at })).into_response()
         }
@@ -437,9 +466,13 @@ pub async fn edit_message(
 
 pub async fn get_message_history(
     Extension(state): Extension<Arc<AppState>>,
-    Path(message_id): Path<i64>,
+    Path(raw_id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let message_id = match parse_msg_id(&raw_id) {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid message id" }))).into_response(),
+    };
     let identity = match require_auth(&state, &headers).await {
         Ok(id) => id,
         Err(e) => return e.into_response(),
@@ -649,9 +682,13 @@ pub async fn get_post_replies(
 
 pub async fn delete_message(
     Extension(state): Extension<Arc<AppState>>,
-    Path(message_id): Path<i64>,
+    Path(raw_id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let message_id = match parse_msg_id(&raw_id) {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid message id" }))).into_response(),
+    };
     let identity = match require_auth(&state, &headers).await {
         Ok(id) => id,
         Err(e) => return e.into_response(),
@@ -688,13 +725,18 @@ pub async fn delete_message(
         rusqlite::params![message_id, identity],
     ) {
         Ok(_) => {
+            let fmt_id = fmt_msg_id(message_id);
             let broadcast = serde_json::to_string(&json!({
                 "type": "message_deleted",
-                "id": message_id,
+                "id": fmt_id,
                 "channel_id": channel_id,
             }))
             .unwrap();
             let _ = state.bus_for(&channel_id).send(broadcast);
+            crate::webhooks::fire_event(Arc::clone(&state), "message_deleted", Some(channel_id.clone()), json!({
+                "id": fmt_id,
+                "channel_id": channel_id,
+            }));
             info!("{identity} deleted message {message_id} in #{channel_id}");
             (StatusCode::OK, Json(json!({ "deleted": true }))).into_response()
         }

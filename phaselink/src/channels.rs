@@ -4,6 +4,25 @@ use std::sync::Arc;
 
 use super::*;
 
+/// Atomically increment the channel sequence counter and return the next `zblcN` ID.
+/// Must be called inside a transaction so the increment and the INSERT are one atomic unit.
+fn next_channel_id(conn: &rusqlite::Connection) -> rusqlite::Result<String> {
+    conn.execute(
+        "INSERT OR IGNORE INTO server_meta (key, value) VALUES ('channel_seq', '0')",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE server_meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'channel_seq'",
+        [],
+    )?;
+    let seq: i64 = conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM server_meta WHERE key = 'channel_seq'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(format!("zblc{seq}"))
+}
+
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Channel {
     pub id: String,
@@ -17,7 +36,6 @@ pub struct Channel {
 
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateChannel {
-    pub id: String,
     pub name: String,
     #[serde(default)]
     pub topic: String,
@@ -146,41 +164,37 @@ pub async fn create_channel(
         )
             .into_response();
     }
-    let id = body.id.trim().to_lowercase();
-    if id.is_empty()
-        || id.len() > 32
-        || !id
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Channel ID must be 1–32 alphanumeric/dash/underscore chars" })),
-        )
-            .into_response();
-    }
-    let insert_result = {
-        let db = match state.db.get() {
+    // Allocate ID and insert atomically so nothing can race between the two steps.
+    let (id, insert_result) = {
+        let mut db = match state.db.get() {
             Ok(db) => db,
-            Err(_) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": "DB unavailable" })),
-                )
-                    .into_response();
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB unavailable" }))).into_response(),
+        };
+        let tx = match db.transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                error!("begin tx: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB error" }))).into_response();
             }
         };
-        db.execute(
+        let id = match next_channel_id(&tx) {
+            Ok(id) => id,
+            Err(e) => {
+                error!("channel_seq: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB error" }))).into_response();
+            }
+        };
+        let result = tx.execute(
             "INSERT INTO channels (id, name, topic, type, category_id, position) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                id,
-                body.name.trim(),
-                body.topic.trim(),
-                body.channel_type,
-                body.category_id,
-                body.position
-            ],
-        )
+            rusqlite::params![id, body.name.trim(), body.topic.trim(), body.channel_type, body.category_id, body.position],
+        );
+        if result.is_ok() {
+            if let Err(e) = tx.commit() {
+                error!("commit: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB error" }))).into_response();
+            }
+        }
+        (id, result)
     };
     match insert_result {
         Ok(_) => {
@@ -244,13 +258,6 @@ pub async fn delete_channel(
         return (
             StatusCode::FORBIDDEN,
             Json(json!({ "error": "Only server owner can delete channels" })),
-        )
-            .into_response();
-    }
-    if channel_id == "general" {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "Cannot delete the general channel" })),
         )
             .into_response();
     }
@@ -323,13 +330,6 @@ pub async fn rename_channel(
         return (
             StatusCode::FORBIDDEN,
             Json(json!({ "error": "Only server owner can rename channels" })),
-        )
-            .into_response();
-    }
-    if channel_id == "general" {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "Cannot rename the general channel" })),
         )
             .into_response();
     }

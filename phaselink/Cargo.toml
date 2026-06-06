@@ -32,6 +32,9 @@ redis = { version = "0.26", features = ["tokio-comp", "connection-manager"] }
 utoipa = { version = "5.3", features = ["axum_extras", "macros"] }
 utoipa-swagger-ui = { version = "8.1", features = ["axum"] }
 infer = "0.16"
+hmac  = "0.12"
+sha2  = "0.10"
+hex   = "0.4"
 
 [dev-dependencies]
 axum-test = "18.7.0"
